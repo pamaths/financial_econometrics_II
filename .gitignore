@@ -1,0 +1,66 @@
+
+# Data
+*.h5
+*.xlsx
+*.xls
+*.xslm
+*.csv
+*.zip
+*.tar.gz
+*.pth
+*.ckpt
+*.sav
+*.npz
+*.npy
+*.db
+*.sqlite3
+*.parquet
+*.lmdb
+*.bin
+
+
+
+# Logging files
+*.log
+
+# Testing frameworks
+.pytest_cache/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+develop-eggs/
+*.egg-info/
+pip-wheel-metadata/
+share/python-wheels/
+build/
+dist/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# Editors
+#.vscode/
+.idea/
+.tox/
+
+# Environments
+env/
+node_modules/
+.env
+venv/
+.venv
+
+
+# Custom/personal
+proto/
+
+# Dynamic versioning
+_version.py
