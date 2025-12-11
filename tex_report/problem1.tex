@@ -1,0 +1,64 @@
+% Simple LaTeX template for answering problem sets
+\documentclass[11pt]{article}
+
+% Encoding and fonts
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+
+% Math packages
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{mathtools}
+\usepackage{amsthm}
+
+% Page layout and graphics
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+
+% Utilities
+\usepackage{enumitem}
+\usepackage{siunitx}
+\usepackage[hidelinks]{hyperref}
+
+% Theorem / problem environments
+\theoremstyle{definition}
+\newtheorem{problem}{Problem}
+\newtheorem{solution}{Solution}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+% Title information (edit as needed)
+\title{Problem Set — Solutions}
+\author{Your Name}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% Add your solutions here
+
+\begin{table}[ht]
+    \centering
+    \small
+    \resizebox{\textwidth}{!}{%
+        \begin{tabular}{lrrrrrr}
+            \toprule
+            & \multicolumn{6}{c}{Panel A} \\
+            & d total deposits & d savings deposits A & d time deposits A & d wholesale funding A & d liabilities A & d deposit spread A \\
+            \midrule
+            Coefficient & -1.820454 & -1.858875 & -2.711721 & 4.450710 & -1.485010 & 0.055904 \\
+            Std. Error & 0.265668 & 0.307680 & 0.313248 & 1.226553 & 0.219687 & 0.014305 \\
+            t-stat & -6.852371 & -6.041596 & -8.656790 & 3.628632 & -6.759652 & 3.907884 \\
+            p-value & 0.000000 & 0.000000 & 0.000000 & 0.000285 & 0.000000 & 0.000093 \\
+            R-squared & 0.000098 & 0.000072 & 0.000190 & 0.000022 & 0.000079 & 0.000034 \\
+            \bottomrule
+        \end{tabular}%
+    }
+    \caption{Regression results}
+    \label{tab:panelA}
+\end{table}
+
+\end{document}
+
+
