@@ -17,8 +17,34 @@
 *.parquet
 *.lmdb
 *.bin
+*.dta
 
-
+# latex compiled files
+*.aux
+*.lof
+*.lot
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.run.xml
+*.synctex.gz
+*.bbl
+*.blg
+*.brf
+*.nav
+*.snm
+*.vrb
+*.idx
+*.ilg
+*.ind
+*.dvi
+*.ps
+*.glo
+*.gls
+*.glg
+*.ist
+*.pdfsync
 
 # Logging files
 *.log
