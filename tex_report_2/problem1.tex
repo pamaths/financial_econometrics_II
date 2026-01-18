@@ -1,0 +1,128 @@
+% Simple LaTeX template for answering problem sets
+\documentclass[11pt]{article}
+
+% Encoding and fonts
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+
+% Math packages
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{mathtools}
+\usepackage{amsthm}
+
+% Page layout and graphics
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{pdflscape}
+
+% Utilities
+\usepackage{enumitem}
+\usepackage{siunitx}
+\usepackage[hidelinks]{hyperref}
+\usepackage{makecell}
+\usepackage{natbib}
+\usepackage{adjustbox}
+
+% Theorem / problem environments
+\theoremstyle{definition}
+\newtheorem{problem}{Problem}
+\newtheorem{solution}{Solution}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+% Title information (edit as needed)
+\title{Problem Set 1 — Solution Write Up}
+\author{Matias Palmunen}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+
+
+
+This write-up summarizes the main results of the Financial Economics II class' first problems set, where I replicate the findings from the paper "The Deposits Channel of Monetary Policy" by \cite{drechsler2017deposits}. The replication focuses on Table VIII, which examines the effects of monetary policy on bank liabilities and assets using commercial bank data from 1994 to 2013. The analysis employs fixed effects regression models to estimate the impact of changes in the Federal Funds rate on various bank-level outcomes, controlling for bank-specific and time-specific factors. 
+
+In the subsequent sections, I detail the variable construction process, present the replicated Table VIII, and discuss the fixed effects specifications and robustness checks conducted to validate the findings.
+
+\section{Variable Construction}
+
+Following \cite{drechsler2017deposits}, I construct regression variables through data acquisition, cleaning, transformation, and outlier treatment. The process involves downloading commercial bank data and Federal Funds rates, filtering for data quality, calculating quarterly log changes, constructing deposit spreads, and winsorizing outliers.
+
+The analysis uses commercial bank call report data from the authors' website\footnote{Available at: \url{https://pages.stern.nyu.edu/~pschnabl/data/data_callreport.htm}} covering 1994-2013. For Federal Funds rates, I query FRED API for the target rate (through 2008) and upper/lower bounds (post-2008), creating a consistent series using the official target pre-2009 and averaging bounds thereafter. Monthly observations are aggregated quarterly, with changes calculated as $\Delta FF_t = FF_{t+1} - FF_t$.
+
+Before variable construction, I apply filters matching the paper's sample selection: removing one extreme outlier (cert 33260, 1996-03-31) with unrealistic deposit rates, excluding 33 banks with incomplete quarterly reporting histories, restricting to commercial banks (charter type 200), and flagging observations with asset changes exceeding 100\% between quarters to exclude from log calculations while maintaining separate asset change groups.
+
+All dependent variables are quarterly log changes: $\Delta Y_{i,t} = \log(Y_{i,t+1}/Y_{i,t})$. Panel A (liabilities) includes changes in total deposits, savings deposits, time deposits, total liabilities, and wholesale funding (liabilities minus deposits). Panel B (assets) covers changes in total assets, cash, securities, total loans, real estate loans, and commercial \& industrial loans. The deposit spread uses quarterly rates calculated as four times the ratio of domestic deposit expense to average deposits, where average deposits are $\frac{1}{2}(Deposits_t + Deposits_{t-1})$ to match quarterly interest accumulation. Changes are calculated as $\Delta DepositSpread_t = DepositSpread_{t+1} - DepositSpread_t$.
+
+Given substantial outliers in dependent variables, I winsorize all variables at the 1\% level from both tails to limit extreme value influence while preserving distribution structure.
+
+\section{Replication of Table VIII}
+
+Given the constructed variables, I follow \cite{drechsler2017deposits} and estimate panel regressions examining how bank market concentration affects the transmission of monetary policy to bank balance sheets. I estimate the following model:
+\begin{equation}\label{eq:main_reg}
+\Delta Y_{i,t} = \alpha_i + \tilde{\alpha}_i \mathbf{1}_{(t \geq 2009)} + \delta_t + \beta_1 HHI_{i,t-1} + \beta_2 (HHI_{i,t-1} \times \Delta FF_t) + \epsilon_{i,t}
+\end{equation}
+
+where $\Delta Y_{i,t}$ represents quarterly log changes in bank balance sheet components, $HHI_{i,t-1}$ is the lagged county-level deposit market Herfindahl index, $\Delta FF_t$ is the change in Federal Funds target rate, and the model includes bank and time fixed effects with post-2008 structural breaks. The coefficient $\beta_2$ captures how market concentration amplifies monetary policy effects.
+
+\input{tables/table8_combined_prod.tex}
+
+The results closely replicate the original findings and provide strong evidence for the deposits channel of monetary policy. The interaction coefficient is statistically significant across all specifications, confirming that banks in more concentrated deposit markets exhibit stronger responses to Federal Funds rate changes. The magnitudes and significance levels closely match the original paper, supporting the robustness of the deposits channel mechanism. Our sample sizes are slightly larger than in the original study, suggesting minor differences in data filtering procedures.
+
+
+\section{Fixed Effects Specification}
+
+Now we use the same regression specification as in \eqref{eq:main_reg} and vary the fixed effects structure to see how sensitive the results are to changes in econometric specification. To assess robustness, I estimate five different fixed effects configurations: (1) None - simple panel regression without fixed effects, (2) Time - time fixed effects only to control for aggregate macroeconomic shocks, (3) Firm - bank fixed effects only to control for time-invariant bank heterogeneity, (4) Firm\&Time - both bank and time fixed effects, and (5) Time\&Firm\&08 - the baseline specification combining time fixed effects with bank fixed effects that vary before and after 2008. It is worth noting that specification with firm fixed effects interacted with 2008 financial crisis indicator behaves quite similarly as simpler specification with just firm fixed effects and is thus not displayed in the figure. 
+
+Figure \ref{fig:fixed_effects} shows the coefficient estimates for the interaction term $\beta_2$ from equation \eqref{eq:main_reg} across all six specifications, displaying point estimates with 95\% confidence intervals for each dependent variable. The results demonstrate that coefficient estimates are sensitive to both time and firm fixed effects, and it is natural that these should be part of the model. Time fixed effects are crucial for removing macroeconomic confounds such as aggregate business cycle fluctuations, regulatory changes, and other time-varying factors that affect all banks simultaneously. Firm fixed effects remove persistent bank heterogeneity, controlling for time-invariant characteristics such as business models, geographical locations, and managerial practices that influence how banks respond to monetary policy.
+
+The comparison shows that specifications without proper fixed effects (None, Time only, or Firm only) often yield different coefficient magnitudes and significance levels. Adding the 2008 crisis indicator doesn't change the results substantially compared to the specification with firm and time fixed effects. However, from an economic perspective, this addition is justified to remove crisis-specific variation such as regulatory shocks, unprecedented policy interventions, and structural changes in banking markets that occurred after the financial crisis might have affected different banks differently.
+
+\begin{landscape}
+\begin{figure}[p]
+    \centering
+    \textbf{Fixed Effects Sensitivity Analysis}
+    \vspace{0.5em}
+    \includegraphics[width=1\linewidth,height=\textheight,keepaspectratio]{figures/fixed_effects_checks_grid.pdf}
+    \caption{
+        Fixed Effects Specifications: 
+This figure displays coefficient estimates (dots) and 95\% confidence intervals (error bars) for the interaction term between Federal Funds rate changes and bank market concentration across six fixed effects specifications. Panel A shows bank liabilities variables and Panel B shows bank assets variables. The six specifications are: None (no fixed effects), Time (time fixed effects only), Firm (firm fixed effects only), Fir\&Tim (firm and time fixed effects), and Tim\&Fi\&08 (time fixed effects plus firm fixed effects interacted with 2008 financial crisis indicator). Statistical significance is indicated by asterisks: *** p<0.01, ** p<0.05, * p<0.10. The comparison demonstrates how different fixed effects structures affect the coefficient estimates, with the most comprehensive specification (Tim\&Fi\&08) representing the paper's preferred model that controls for both time-varying aggregate shocks and firm-specific heterogeneity that may differ before and after the financial crisis}
+    \label{fig:fixed_effects}
+\end{figure}
+\end{landscape}
+
+
+\section{Robustness Checks with Subsample Analyses}
+
+To test the heterogeneity of the results to different subsamples, I use the same model specification as in Table \ref{tab:table8} and estimate the model for three subsamples: one ending at the end of 2007, a second for the top 25\% largest banks, and a third for the top 10\% largest banks measured by average value of assets over their lifetime.
+
+Results of the robustness checks are presented in Figure \ref{fig:robustness_checks}, showing coefficient point estimates with 95\% confidence intervals. The majority of results appear robust to the pre-2008 specification, indicating that the findings are not solely driven by crisis-period dynamics. Most results also seem robust across bank sizes, suggesting that the deposits channel operates consistently across different bank categories.
+
+However, some effects such as real estate loans, cash, and commercial \& industrial loans appear to change sign when comparing the full sample with the sample containing only the largest banks. This suggests that part of the effects might be driven by smaller banks, potentially reflecting, for example, different business models, market positions, and potentially different balance sheet optimization decisions. 
+
+However, it is worth keeping in mind that the sample size of approximately 50,000 observations for the biggest banks is substantially smaller than the baseline sample, which, as expected, has significant effects on the statistical significance of the results \footnote{Note that since the standard errors scale approximately in square root of the sample size, just by the limited size of the sample we expect the standard errors of the Top 10\% sample to be approximately $\sqrt{567,092 / 49,995} \approx 3.4$ times larger than those of the baseline sample (which explains the large differences in confidence intervals).}.
+
+\begin{landscape}
+\begin{figure}[p]
+    \centering
+    \textbf{Robustness Across Subsamples}
+    \vspace{0.5em}
+    \includegraphics[width=\linewidth,height=\textheight,keepaspectratio]{figures/robustness_checks_grid.pdf}
+    \caption{
+        Robustness checks with subsample analyses:
+This figure displays coefficient estimates (dots) and 95\% confidence intervals (error bars) for the interaction term between Federal Funds rate changes and bank market concentration across four robustness specifications. Panel A shows bank liabilities variables and Panel B shows bank assets variables. The four specifications are: Baseline (full sample, median N=567,092), Pre-2008 (excluding financial crisis period, median N=421,667), Top 10\% (largest 10\% of banks by average asset value over their lifetime, median N=49,995), and Top 25\% (largest 25\% of banks by average asset value over their lifetime, median N=135,480). Statistical significance is indicated by asterisks: *** p<0.01, ** p<0.05, * p<0.10.    }
+    \label{fig:robustness_checks}
+\end{figure}
+\end{landscape}
+
+
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
+
+
