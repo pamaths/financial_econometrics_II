@@ -32,6 +32,16 @@ required_packages <- c("tidyverse", "haven", "knitr", "kableExtra", "here")
 new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
 if(length(new_packages)) install.packages(new_packages)
 
+
+packages <- c("bacondecomp", "fixest", "did", "did2s", "didimputation")
+for (pkg in packages) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+    library(pkg, character.only = TRUE)
+  }
+}
+
+
 # Load libraries
 library(tidyverse)
 library(haven)
@@ -106,10 +116,6 @@ head(ps2_data)
 ```
 
 
-## Problem (a): Read the Paper
-
-I have read Gallagher (2014), which examines how experiencing a flood affects homeowners' beliefs about future flood risk, as proxied by flood insurance policy take-up.
-
 ## Problem (b): Event Study Graph
 
 ### Data Preparation
@@ -156,13 +162,7 @@ tibble(
 
 ```{r create-relative-time}
 # Install and load packages
-packages <- c("bacondecomp", "fixest", "did", "did2s")
-for (pkg in packages) {
-  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
-    install.packages(pkg, repos = "https://cloud.r-project.org")
-    library(pkg, character.only = TRUE)
-  }
-}
+
 
 # Create treatment year variable
 ps2_data <- ps2_data %>%
@@ -194,6 +194,7 @@ treatment_timing %>%
 ### Event Study Regression
 
 Following Baker et al. (2022) recommendations on binning, I'll create binned endpoints for the event study.
+- Use 6 bins to capture dynamics while avoiding sparse data issues.
 
 ```{r event-study-regression}
 # Create relative time dummies with binning
@@ -276,6 +277,80 @@ ggplot(event_study_coefs, aes(x = rel_time, y = estimate)) +
     axis.title = element_text(size = 11)
   )
 ```
+
+### Extended Event Study Plot (Binning at ±11)
+
+- This binning is similar to the paper
+
+```{r event-study-regression-extended}
+# Create relative time dummies with extended binning
+# Bin at -11 and earlier, and +11 and later
+ps2_data <- ps2_data %>%
+  mutate(
+    rel_time_binned_ext = case_when(
+      is.infinite(treatment_year) ~ NA_real_,
+      rel_time <= -11 ~ -11,
+      rel_time >= 11 ~ 11,
+      TRUE ~ rel_time
+    )
+  )
+
+# Event study regression with extended time window
+event_study_formula_ext <- as.formula(paste(
+  "ln_policies ~ ",
+  paste0("i(rel_time_binned_ext, ref = -1)"),
+  " | id_num + year"
+))
+
+event_study_model_ext <- feols(
+  event_study_formula_ext,
+  data = ps2_data %>% filter(!is.infinite(treatment_year)),
+  cluster = ~ state
+)
+
+# Extract coefficients for plotting
+event_study_coefs_ext <- broom::tidy(event_study_model_ext, conf.int = TRUE) %>%
+  filter(grepl("rel_time", term)) %>%
+  mutate(
+    rel_time = as.numeric(gsub(".*::([-0-9]+).*", "\\1", term))
+  ) %>%
+  # Add the omitted period (-1) with coefficient 0
+  bind_rows(
+    tibble(
+      term = "rel_time_binned_ext::-1",
+      estimate = 0,
+      std.error = 0,
+      statistic = NA,
+      p.value = NA,
+      conf.low = 0,
+      conf.high = 0,
+      rel_time = -1
+    )
+  ) %>%
+  arrange(rel_time)
+
+# Create extended event study plot
+ggplot(event_study_coefs_ext, aes(x = rel_time, y = estimate)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = -0.5, linetype = "dotted", color = "blue") +
+  labs(
+    title = "Event Study: Effect of Floods on Log Insurance Policies per Capita (Extended Window)",
+    subtitle = "Gallagher (2014) replication with extended time horizon",
+    x = "Years Relative to Flood",
+    y = "Coefficient Estimate",
+    caption = "Note: Confidence intervals based on state-level clustering. \nPeriod -1 omitted as reference. Endpoints binned at -11 and +11."
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    axis.title = element_text(size = 11)
+  )
+```
+
+
 
 ### (b)(i) Interpretation of Plotted Coefficients
 
@@ -500,6 +575,7 @@ The Bacon-Goodman decomposition reveals potential problems with the standard TWF
 
 3. **Direction of bias**: If treatment effects grow over time, the late-to-early ATT may be biased, potentially even having the wrong sign relative to the true effect.
 
+Given the estimates and high weight on "Treated vs Untreated" expect the results to be quite robust. However, there is 
 ## Problem (d): Imputation Estimator by Hand
 
 Following Borusyak et al. (2024), I'll implement the imputation estimator manually.
@@ -565,36 +641,45 @@ ps2_data_impute %>%
 ### Event Study Plot with Imputation Estimator
 
 ```{r imputation-event-study}
-# Regress tau_hat on relative time indicators
 imputation_event_data <- ps2_data_impute %>%
-  filter(!is.na(tau_hat)) %>%
+  filter(!is.infinite(treatment_year)) %>%
   mutate(
+    tau_hat_all = ln_policies - Y_hat_0,
     rel_time_binned = case_when(
       rel_time <= -6 ~ -6,
       rel_time >= 6 ~ 6,
       TRUE ~ rel_time
     )
-  )
+  ) %>%
+  filter(!is.na(tau_hat_all) & !is.na(rel_time_binned))
 
-# Run regression of tau_hat on relative time dummies
-# No fixed effects needed since tau_hat already accounts for them
-# Create factor with -1 as reference level
-imputation_event_data <- imputation_event_data %>%
-  mutate(rel_time_factor = factor(rel_time_binned))
+rel_time_values <- sort(unique(imputation_event_data$rel_time_binned))
+rel_time_values <- rel_time_values[rel_time_values != -1]
 
-imputation_model <- lm(tau_hat ~ rel_time_factor, data = imputation_event_data)
-
-# Extract coefficients
-imputation_coefs <- broom::tidy(imputation_model, conf.int = TRUE) %>%
-  mutate(
-    rel_time = case_when(
-      term == "(Intercept)" ~ as.numeric(levels(imputation_event_data$rel_time_factor)[1]),
-      TRUE ~ as.numeric(gsub("rel_time_factor", "", term))
+imputation_coefs <- map_dfr(rel_time_values, function(t) {
+  data_t <- imputation_event_data %>%
+    mutate(treat_t = as.numeric(rel_time_binned == t))
+  
+  model <- lm(tau_hat_all ~ treat_t, data = data_t)
+  
+  broom::tidy(model, conf.int = TRUE) %>%
+    filter(term == "treat_t") %>%
+    mutate(rel_time = t)
+}) %>%
+  bind_rows(
+    tibble(
+      term = "treat_t",
+      estimate = 0,
+      std.error = 0,
+      statistic = NA,
+      p.value = NA,
+      conf.low = 0,
+      conf.high = 0,
+      rel_time = -1
     )
   ) %>%
   arrange(rel_time)
 
-# Plot
 ggplot(imputation_coefs, aes(x = rel_time, y = estimate)) +
   geom_point(size = 3, color = "darkblue") +
   geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
@@ -606,9 +691,14 @@ ggplot(imputation_coefs, aes(x = rel_time, y = estimate)) +
     subtitle = "Following Borusyak et al. (2024)",
     x = "Years Relative to Flood",
     y = "Treatment Effect Estimate",
-    caption = "Note: Counterfactuals estimated from never-treated and not-yet-treated units only."
+    caption = "Note: Counterfactuals estimated from never-treated and not-yet-treated units only.\nPeriod -1 omitted as reference. Endpoints binned at -6 and +6."
   ) +
-  theme_minimal()
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    axis.title = element_text(size = 11)
+  )
 ```
 
 **Interpretation:**
@@ -650,9 +740,9 @@ att_manual %>%
 att_regression <- lm(tau_hat ~ 1, data = ps2_data_impute %>% filter(!is.na(tau_hat)))
 ```
 
-### ATT Using did_imputation Package
+### ATT Using did2s Package
 
-```{r att-package}
+```{r att-package-did2s}
 # Prepare data for did2s package
 did_data <- ps2_data %>%
   filter(!is.infinite(treatment_year)) %>%
@@ -703,57 +793,141 @@ cat("\n")
 ### Event Study Plot with did2s
 
 ```{r did2s-event-study, fig.width=10, fig.height=6}
-did_data_es <- ps2_data %>%
+# # Prepare data with all necessary variables
+# did_data_es <- ps2_data %>%
+#   filter(!is.infinite(treatment_year)) %>%
+#   mutate(
+#     rel_time_binned = case_when(
+#       rel_time <= -6 ~ -6,
+#       rel_time >= 6 ~ 6,
+#       TRUE ~ rel_time
+#     )
+#   )
+
+# rel_time_values <- -6:6
+# rel_time_values <- rel_time_values[rel_time_values != -1]
+
+# did2s_es_coefs <- map_dfr(rel_time_values, function(t) {
+#   did_data_es_t <- did_data_es %>%
+#     mutate(treat_t = as.logical(rel_time_binned == t))
+  
+#   result <- did2s(
+#     data = did_data_es_t,
+#     yname = "ln_policies",
+#     first_stage = ~ 0 | id_num + year,
+#     second_stage = ~ treat_t,
+#     treatment = "treat_t",
+#     cluster_var = "state"
+#   )
+  
+#   coef_summary <- broom::tidy(result, conf.int = TRUE) %>%
+#     filter(term == "treat_t") %>%
+#     mutate(rel_time = t)
+  
+#   return(coef_summary)
+# }) %>%
+#   bind_rows(
+#     tibble(
+#       term = "treat_t",
+#       estimate = 0,
+#       std.error = 0,
+#       statistic = NA,
+#       p.value = NA,
+#       conf.low = 0,
+#       conf.high = 0,
+#       rel_time = -1
+#     )
+#   ) %>%
+#   arrange(rel_time)
+
+# ggplot(did2s_es_coefs, aes(x = rel_time, y = estimate)) +
+#   geom_point(size = 3, color = "darkgreen") +
+#   geom_errorbar(aes(ymin = conf.low, ymax = conf.high), 
+#                 width = 0.2, color = "darkgreen") +
+#   geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+#   geom_vline(xintercept = -0.5, linetype = "dotted", color = "blue") +
+#   labs(
+#     title = "Event Study: did2s Estimator (Gardner 2021)",
+#     subtitle = "Two-stage difference-in-differences with proper controls",
+#     x = "Years Relative to Flood",
+#     y = "Treatment Effect Estimate",
+#     caption = "Note: Estimates from did2s package with state-level clustering.\nPeriod -1 omitted as reference. Endpoints binned at -6 and +6."
+#   ) +
+#   theme_minimal() +
+#   theme(
+#     plot.title = element_text(face = "bold", size = 14),
+#     plot.subtitle = element_text(size = 11),
+#     axis.title = element_text(size = 11)
+#   )
+```
+
+### ATT Using did_imputation Package
+
+```{r att-package-didimputation}
+did_imputation_data <- ps2_data %>%
   filter(!is.infinite(treatment_year))
 
-rel_time_values <- -6:6
-rel_time_values <- rel_time_values[rel_time_values != -1]
+dimp_result <- did_imputation(
+  data = did_imputation_data,
+  yname = "ln_policies",
+  gname = "treatment_year",
+  tname = "year",
+  idname = "id_num",
+  first_stage = ~ 0 | id_num + year,
+  cluster_var = "state"
+)
 
-did2s_es_coefs <- map_dfr(rel_time_values, function(t) {
-  did_data_es_t <- did_data_es %>%
-    mutate(treat_t = as.numeric(rel_time_binned == t))
-  
-  result <- did2s(
-    data = did_data_es_t,
-    yname = "ln_policies",
-    first_stage = ~ 0 | id_num + year,
-    second_stage = ~ treat_t,
-    treatment = "treat_t",
-    cluster_var = "state"
-  )
-  
-  coef_summary <- broom::tidy(result, conf.int = TRUE) %>%
-    filter(term == "treat_t") %>%
-    mutate(rel_time = t)
-  
-  return(coef_summary)
-}) %>%
-  bind_rows(
-    tibble(
-      term = "treat_t",
-      estimate = 0,
-      std.error = 0,
-      statistic = NA,
-      p.value = NA,
-      conf.low = 0,
-      conf.high = 0,
-      rel_time = -1
-    )
+dimp_result %>%
+  as.data.frame() %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  kable(caption = "did_imputation Package Results (Borusyak et al. 2024)")
+
+att_dimp <- mean(dimp_result$estimate, na.rm = TRUE)
+se_dimp <- mean(dimp_result$std.error, na.rm = TRUE)
+
+cat("\n")
+```
+
+### Event Study Plot with did_imputation
+
+```{r didimputation-event-study, fig.width=10, fig.height=6}
+dimp_es_data <- ps2_data %>%
+  filter(!is.infinite(treatment_year))
+
+dimp_es_result <- did_imputation(
+  data = dimp_es_data,
+  yname = "ln_policies",
+  gname = "treatment_year",
+  tname = "year",
+  idname = "id_num",
+  first_stage = ~ 0 | id_num + year,
+  horizon = TRUE,
+  pretrends = TRUE,
+  cluster_var = "state"
+)
+
+dimp_es_coefs <- dimp_es_result %>%
+  as.data.frame() %>%
+  filter(!is.na(term)) %>%
+  mutate(
+    rel_time = as.numeric(gsub(".*[^0-9-]([0-9-]+)$", "\\1", term)),
+    conf.low = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error
   ) %>%
   arrange(rel_time)
 
-ggplot(did2s_es_coefs, aes(x = rel_time, y = estimate)) +
-  geom_point(size = 3, color = "darkgreen") +
+ggplot(dimp_es_coefs, aes(x = rel_time, y = estimate)) +
+  geom_point(size = 3, color = "purple") +
   geom_errorbar(aes(ymin = conf.low, ymax = conf.high), 
-                width = 0.2, color = "darkgreen") +
+                width = 0.2, color = "purple") +
   geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
   geom_vline(xintercept = -0.5, linetype = "dotted", color = "blue") +
   labs(
-    title = "Event Study: did2s Estimator (Gardner 2021)",
-    subtitle = "Two-stage difference-in-differences with proper controls",
+    title = "Event Study: did_imputation Estimator (Borusyak et al. 2024)",
+    subtitle = "Imputation-based difference-in-differences",
     x = "Years Relative to Flood",
     y = "Treatment Effect Estimate",
-    caption = "Note: Estimates from did2s package with state-level clustering.\nPeriod -1 omitted as reference. Endpoints binned at -6 and +6."
+    caption = "Note: Estimates from did_imputation package with state-level clustering.\nReference period at -1."
   ) +
   theme_minimal() +
   theme(
@@ -768,13 +942,14 @@ ggplot(did2s_es_coefs, aes(x = rel_time, y = estimate)) +
 ```{r comparison}
 # Create comprehensive comparison table
 tibble(
-  Method = c("Manual Implementation", "Package (did2s)"),
-  `ATT Estimate` = c(att_manual$ATT, att_package),
-  `Standard Error` = c(att_manual$SE_incorrect, se_package),
-  `SE Note` = c("Incorrect (naive)", "Correct (clustered)")
+  Method = c("Manual Implementation", "Package (did2s)", "Package (did_imputation)"),
+  `ATT Estimate` = c(att_manual$ATT, att_package, att_dimp),
+  `Standard Error` = c(att_manual$SE_incorrect, se_package, se_dimp),
+  `SE Note` = c("Incorrect (naive)", "Correct (clustered)", "Correct (clustered)")
 ) %>%
   mutate(across(where(is.numeric), ~round(., 4))) %>%
-  kable(caption = "Comparison of ATT Estimates")
+  kable(caption = "Comparison of ATT Estimates") %>%
+  footnote(general = "did2s: Gardner (2021); did_imputation: Borusyak et al. (2024)")
 
 # Additional diagnostics
 tibble(
@@ -790,8 +965,9 @@ tibble(
 **Discussion:**
 
 1. **Do we get the same ATT estimate?**
-   - The ATT estimates should be very similar (potentially with small numerical differences due to implementation details)
-   - Both methods use the same underlying logic: estimate counterfactuals from untreated units
+   - The ATT estimates should be very similar across all three implementations (potentially with small numerical differences due to implementation details)
+   - The manual implementation, did2s (Gardner 2021), and did_imputation (Borusyak et al. 2024) all use similar underlying logic: estimate counterfactuals from untreated units
+   - did2s and did_imputation are both modern estimators that avoid the "forbidden comparisons" problem in staggered DiD settings
 
 2. **Why are the manual standard errors incorrect?**
 
