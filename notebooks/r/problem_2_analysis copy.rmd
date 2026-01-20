@@ -1,0 +1,830 @@
+---
+title: "Financial Econometrics II"
+author: "Matias Palmunen"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+## Introduction
+
+This document contains analysis for Financial Econometrics II.
+
+## Load Libraries
+
+```{r load-libraries}
+# Install packages if they don't exist
+required_packages <- c("tidyverse", "haven", "knitr", "kableExtra", "here")
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
+# Load libraries
+library(tidyverse)
+library(haven)
+library(knitr)
+library(kableExtra)
+library(here)
+library(ggplot2)
+```
+
+## Helper Functions
+
+```{r helper-functions}
+# Function to save figures for LaTeX with proper sizing
+save_figure <- function(plot, filename, width = 6.5, height = 4) {
+  # Ensure the figures directory exists
+  fig_dir <- here::here("tex_report_2", "figures")
+  if (!dir.exists(fig_dir)) {
+    dir.create(fig_dir, recursive = TRUE)
+  }
+  
+  # Construct the full path
+  filepath <- file.path(fig_dir, filename)
+  
+  # Save the plot
+  ggplot2::ggsave(
+    filename = filepath,
+    plot = plot,
+    width = width,
+    height = height,
+    units = "in",
+    dpi = 300,
+    device = "pdf"
+  )
+  
+  cat("Figure saved to:", filepath, "\n")
+}
+
+# Function to save tables in LaTeX tabular format
+save_table <- function(data, filename, caption = "", label = "") {
+  # Ensure the tables directory exists
+  tables_dir <- here::here("tex_report_2", "tables")
+  if (!dir.exists(tables_dir)) {
+    dir.create(tables_dir, recursive = TRUE)
+  }
+  
+  # Construct the full path
+  filepath <- file.path(tables_dir, filename)
+  
+  # Convert to LaTeX table using kable
+  latex_table <- kable(data, 
+                       format = "latex", 
+                       booktabs = TRUE,
+                       caption = caption,
+                       label = label)
+  
+  # Write to file
+  writeLines(as.character(latex_table), filepath)
+  
+  cat("Table saved to:", filepath, "\n")
+}
+```
+
+## Load Data
+
+```{r load-data}
+# Load data from the data folder
+data_path <- here::here("data", "PS2_data.dta")
+ps2_data <- read_dta(data_path) %>%
+  as_tibble()
+
+head(ps2_data)
+```
+
+
+## Problem (a): Read the Paper
+
+I have read Gallagher (2014), which examines how experiencing a flood affects homeowners' beliefs about future flood risk, as proxied by flood insurance policy take-up.
+
+## Problem (b): Event Study Graph
+
+### Data Preparation
+
+```{r data-prep}
+# Load the data
+data_path <- here::here("data", "PS2_data.dta")
+ps2_data <- read_dta(data_path) %>%
+  as_tibble()
+
+# Examine the data structure
+cat("Dataset dimensions:", nrow(ps2_data), "rows ×", ncol(ps2_data), "columns\n\n")
+
+# Show first few rows
+ps2_data %>%
+  head(10) %>%
+  kable(caption = "First 10 rows of PS2 data")
+
+# Check for communities that experienced floods
+flood_summary <- ps2_data %>%
+  group_by(id_num) %>%
+  summarize(
+    num_floods = sum(hityear, na.rm = TRUE),
+    flood_year = ifelse(any(hityear == 1), year[which(hityear == 1)[1]], NA)
+  )
+
+# Communities with exactly one flood
+treated_communities <- flood_summary %>%
+  filter(num_floods == 1)
+
+# Never-treated communities
+never_treated <- flood_summary %>%
+  filter(num_floods == 0)
+
+# Display summary statistics
+tibble(
+  Category = c("Communities with exactly 1 flood", "Never-treated communities", "Total communities"),
+  Count = c(nrow(treated_communities), nrow(never_treated), nrow(flood_summary))
+) %>%
+  kable(caption = "Community Treatment Status Summary")
+```
+
+### Create Relative Time Variables
+
+```{r create-relative-time}
+# Install and load packages
+packages <- c("bacondecomp", "fixest", "did", "did2s")
+for (pkg in packages) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# Create treatment year variable
+ps2_data <- ps2_data %>%
+  group_by(id_num) %>%
+  mutate(
+    treatment_year = ifelse(any(hityear == 1),
+                           year[which(hityear == 1)[1]],
+                           Inf),
+    # Relative time to treatment
+    rel_time = year - treatment_year,
+    # Post treatment indicator
+    post = as.numeric(year >= treatment_year),
+    # Never treated indicator
+    never_treated = is.infinite(treatment_year)
+  ) %>%
+  ungroup()
+
+# Check distribution of treatment timing
+treatment_timing <- ps2_data %>%
+  filter(!is.infinite(treatment_year)) %>%
+  distinct(id_num, treatment_year) %>%
+  count(treatment_year) %>%
+  rename(`Treatment Year` = treatment_year, `Number of Communities` = n)
+
+treatment_timing %>%
+  kable(caption = "Distribution of Treatment Timing")
+```
+
+### Event Study Regression
+
+Following Baker et al. (2022) recommendations on binning, I'll create binned endpoints for the event study.
+
+```{r event-study-regression}
+# Create relative time dummies with binning
+# Bin at -6 and earlier, and +6 and later
+ps2_data <- ps2_data %>%
+  mutate(
+    rel_time_binned = case_when(
+      is.infinite(treatment_year) ~ NA_real_,
+      rel_time <= -6 ~ -6,
+      rel_time >= 6 ~ 6,
+      TRUE ~ rel_time
+    )
+  )
+
+# Create dummy variables for each relative time (omit -1 as base period)
+rel_time_range <- -6:6
+rel_time_range <- rel_time_range[rel_time_range != -1]  # Omit -1 as base
+
+# Event study regression with community and year fixed effects
+# Using fixest for two-way fixed effects
+event_study_formula <- as.formula(paste(
+  "ln_policies ~ ",
+  paste0("i(rel_time_binned, ref = -1)"),
+  " | id_num + year"
+))
+
+event_study_model <- feols(
+  event_study_formula,
+  data = ps2_data %>% filter(!is.infinite(treatment_year)),
+  cluster = ~ state  # Cluster by state as in Gallagher (2014)
+)
+
+# Display model summary
+broom::tidy(event_study_model, conf.int = TRUE) %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  kable(caption = "Event Study Regression Results")
+
+# Extract coefficients for plotting
+event_study_coefs <- broom::tidy(event_study_model, conf.int = TRUE) %>%
+  filter(grepl("rel_time", term)) %>%
+  mutate(
+    rel_time = as.numeric(gsub(".*::([-0-9]+).*", "\\1", term))
+  ) %>%
+  # Add the omitted period (-1) with coefficient 0
+  bind_rows(
+    tibble(
+      term = "rel_time_binned::-1",
+      estimate = 0,
+      std.error = 0,
+      statistic = NA,
+      p.value = NA,
+      conf.low = 0,
+      conf.high = 0,
+      rel_time = -1
+    )
+  ) %>%
+  arrange(rel_time)
+```
+
+### Event Study Plot
+
+```{r event-study-plot, fig.width=10, fig.height=6}
+# Create event study plot
+ggplot(event_study_coefs, aes(x = rel_time, y = estimate)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = -0.5, linetype = "dotted", color = "blue") +
+  labs(
+    title = "Event Study: Effect of Floods on Log Insurance Policies per Capita",
+    subtitle = "Gallagher (2014) replication",
+    x = "Years Relative to Flood",
+    y = "Coefficient Estimate",
+    caption = "Note: Confidence intervals based on state-level clustering. \nPeriod -1 omitted as reference. Endpoints binned at -6 and +6."
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    axis.title = element_text(size = 11)
+  )
+```
+
+### (b)(i) Interpretation of Plotted Coefficients
+
+The plotted coefficients represent the differential change in log flood insurance policies per capita for communities that experienced a flood relative to communities that did not, at each time period relative to the flood event.
+
+Key interpretations:
+
+1. **Pre-treatment coefficients (rel_time < 0)**: These should be close to zero and statistically insignificant if the parallel trends assumption holds. They test whether treated and control communities had similar trends before the flood.
+
+2. **Post-treatment coefficients (rel_time >= 0)**: These capture the causal effect of experiencing a flood on insurance take-up. We expect positive coefficients if floods increase awareness and perceived risk.
+
+3. **Dynamic effects**: The pattern across post-treatment periods shows how the effect evolves over time - whether it's immediate, grows, or fades.
+
+4. **Magnitude**: Since the outcome is in logs, coefficients can be interpreted approximately as percentage changes (exact: exp(β) - 1).
+
+### (b)(ii) Standard Error Clustering
+
+```{r clustering-discussion}
+# Gallagher (2014) clusters at the state level
+# Let's compare different clustering approaches
+
+# State-level clustering (Gallagher's choice)
+model_state_cluster <- feols(
+  event_study_formula,
+  data = ps2_data %>% filter(!is.infinite(treatment_year)),
+  cluster = ~ state
+)
+
+# Community-level clustering
+model_community_cluster <- feols(
+  event_study_formula,
+  data = ps2_data %>% filter(!is.infinite(treatment_year)),
+  cluster = ~ id_num
+)
+
+# Two-way clustering (state and year)
+model_twoway_cluster <- feols(
+  event_study_formula,
+  data = ps2_data %>% filter(!is.infinite(treatment_year)),
+  cluster = ~ state + year
+)
+
+# Compare standard errors across different clustering approaches
+bind_rows(
+  broom::tidy(model_state_cluster, conf.int = TRUE) %>% mutate(Clustering = "State"),
+  broom::tidy(model_community_cluster, conf.int = TRUE) %>% mutate(Clustering = "Community"),
+  broom::tidy(model_twoway_cluster, conf.int = TRUE) %>% mutate(Clustering = "State + Year")
+) %>%
+  select(Clustering, term, estimate, std.error, p.value) %>%
+  mutate(across(c(estimate, std.error, p.value), ~round(., 4))) %>%
+  filter(term != "(Intercept)") %>%
+  head(15) %>%
+  kable(caption = "Comparison of Standard Errors by Clustering Method (Selected Coefficients)",
+        col.names = c("Clustering", "Term", "Estimate", "Std. Error", "P-value"))
+```
+
+**Comments on Clustering Choice:**
+
+Gallagher (2014) clusters standard errors at the state level. This choice is appropriate because:
+
+1. **Geographic correlation**: Flood experiences and insurance decisions may be correlated within states due to common regulations, insurance markets, and weather patterns.
+
+2. **Treatment variation**: The treatment (floods) likely varies at a level between individual communities and states, so state-level clustering is conservative.
+
+3. **Bertrand et al. (2004) guidance**: With panel data and treatment that varies at the state-year level, clustering at the state level accounts for serial correlation and within-state correlation.
+
+**My assessment**: State-level clustering is appropriate and conservative. Alternative approaches could include:
+- Two-way clustering (state and year) to account for common time shocks
+- Community-level clustering if we believe communities are independent, but this would likely understate standard errors
+
+I would make the same choice as Gallagher for the main results, but might show robustness to two-way clustering.
+
+## Problem (c): Bacon-Goodman Decomposition
+
+```{r bacon-decomposition}
+# Prepare data for Bacon decomposition
+# Need a binary treatment variable (ever treated)
+# Include both treated and never-treated units
+bacon_data <- ps2_data %>%
+  mutate(
+    treat_year = ifelse(is.infinite(treatment_year), 0, treatment_year),
+    treated = post
+  )
+
+# Check if panel is balanced and balance it if needed
+panel_structure <- bacon_data %>%
+  group_by(id_num) %>%
+  summarize(n_periods = n(), .groups = 'drop')
+
+# Keep only units that appear in all periods
+max_periods <- max(panel_structure$n_periods)
+balanced_ids <- panel_structure %>%
+  filter(n_periods == max_periods) %>%
+  pull(id_num)
+
+bacon_data_balanced <- bacon_data %>%
+  filter(id_num %in% balanced_ids)
+
+# Display panel balance information
+tibble(
+  Metric = c("Original panel size", "Balanced panel size", "Number of units"),
+  Value = c(nrow(bacon_data), nrow(bacon_data_balanced), length(balanced_ids))
+) %>%
+  kable(caption = "Panel Structure for Bacon Decomposition")
+
+# For computational feasibility, sample units if needed
+set.seed(42)
+if (length(balanced_ids) > 1000) {
+  sampled_ids <- sample(balanced_ids, 1000)
+  bacon_data_final <- bacon_data_balanced %>%
+    filter(id_num %in% sampled_ids)
+  cat("Sampling to", length(sampled_ids), "units for computational feasibility\n")
+} else {
+  bacon_data_final <- bacon_data_balanced
+}
+
+# Run Bacon decomposition
+# Note: bacon requires a balanced panel and specific data structure
+bacon_decomp <- bacon(
+  ln_policies ~ treated,
+  data = bacon_data_final,
+  id_var = "id_num",
+  time_var = "year"
+)
+
+# Summarize decomposition
+bacon_decomp %>%
+  as_tibble() %>%
+  group_by(type) %>%
+  summarise(
+    `N Comparisons` = n(),
+    `Total Weight` = sum(weight),
+    `Avg Estimate` = mean(estimate),
+    .groups = 'drop'
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  kable(caption = "Bacon-Goodman Decomposition Summary")
+
+# Visualize decomposition
+ggplot(bacon_decomp, aes(x = weight, y = estimate, shape = type, color = type)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Bacon-Goodman Decomposition",
+    subtitle = "Weights and estimates by comparison type",
+    x = "Weight",
+    y = "2x2 DiD Estimate",
+    shape = "Comparison Type",
+    color = "Comparison Type"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Calculate aggregate statistics
+bacon_summary <- bacon_decomp %>%
+  group_by(type) %>%
+  summarize(
+    total_weight = sum(weight),
+    avg_estimate = weighted.mean(estimate, weight),
+    n_comparisons = n(),
+    .groups = 'drop'
+  )
+
+print(bacon_summary)
+```
+
+### Interpretation of Bacon Decomposition
+
+```{r bacon-interpretation}
+# Extract late-to-early comparisons
+late_to_early_data <- bacon_decomp %>%
+  filter(type == "Later vs Earlier Treated") %>%
+  filter(!is.na(estimate) & !is.na(weight))
+
+# Check if there are any late-to-early comparisons
+if (nrow(late_to_early_data) > 0) {
+  late_to_early <- late_to_early_data %>%
+    summarize(
+      weight = sum(weight, na.rm = TRUE),
+      att = sum(estimate * weight, na.rm = TRUE) / sum(weight, na.rm = TRUE),
+      .groups = 'drop'
+    )
+  
+  # Create results table
+  results_df <- bind_rows(
+    bacon_summary %>% mutate(Category = "By Type"),
+    late_to_early %>% 
+      mutate(type = "Late-to-Early", Category = "Specific") %>%
+      rename(total_weight = weight, avg_estimate = att) %>%
+      mutate(n_comparisons = NA)
+  ) %>%
+    select(Category, type, n_comparisons, total_weight, avg_estimate) %>%
+    mutate(across(where(is.numeric), ~round(., 4)))
+  
+  results_df %>%
+    kable(caption = "Bacon Decomposition Results",
+          col.names = c("Category", "Type", "N Comparisons", "Total Weight", "Avg Estimate"))
+} else {
+  bacon_summary %>%
+    mutate(across(where(is.numeric), ~round(., 4))) %>%
+    kable(caption = "Bacon Decomposition Results (No Late-to-Early Comparisons Found)")
+  
+  cat("\n**Note:** No 'Later vs Earlier Treated' comparisons found. This can occur if all treated units are treated at the same time or the sample doesn't include staggered treatment timing.\n")
+}
+
+# Display aggregate TWFE estimate
+twfe_aggregate <- sum(bacon_decomp$estimate * bacon_decomp$weight, na.rm = TRUE)
+tibble(
+  Estimate = "Aggregate TWFE",
+  Value = round(twfe_aggregate, 4)
+) %>%
+  kable()
+```
+
+**Interpretation:**
+
+The Bacon-Goodman decomposition reveals potential problems with the standard TWFE approach in staggered DiD settings:
+
+1. **Forbidden comparisons**: The "later vs earlier" comparisons use already-treated units as controls, which is problematic if treatment effects are heterogeneous or time-varying.
+
+2. **Weight on problematic comparisons**: The proportion of weight on late-to-early comparisons indicates how much the TWFE estimator relies on potentially biased comparisons.
+
+3. **Direction of bias**: If treatment effects grow over time, the late-to-early ATT may be biased, potentially even having the wrong sign relative to the true effect.
+
+## Problem (d): Imputation Estimator by Hand
+
+Following Borusyak et al. (2024), I'll implement the imputation estimator manually.
+
+```{r imputation-manual}
+# Step 1: Estimate fixed effects using only untreated observations
+# Untreated observations are those where post == 0 (not yet treated or never treated)
+
+untreated_data <- ps2_data %>%
+  filter(post == 0 | is.infinite(treatment_year))
+
+# Estimate unit and time fixed effects on untreated sample
+fe_model_untreated <- feols(
+  ln_policies ~ 1 | id_num + year,
+  data = untreated_data
+)
+
+# Step 2: Extract fixed effects
+# Get unit fixed effects (lambda_i)
+unit_fes <- fixef(fe_model_untreated)$id_num
+# Get time fixed effects (gamma_t)
+time_fes <- fixef(fe_model_untreated)$year
+
+# Create data frames for merging
+unit_fe_df <- tibble(
+  id_num = as.numeric(names(unit_fes)),
+  lambda_i = as.numeric(unit_fes)
+)
+
+time_fe_df <- tibble(
+  year = as.numeric(names(time_fes)),
+  gamma_t = as.numeric(time_fes)
+)
+
+# Step 3: For treated observations, impute counterfactual Y(0)
+ps2_data_impute <- ps2_data %>%
+  left_join(unit_fe_df, by = "id_num") %>%
+  left_join(time_fe_df, by = "year") %>%
+  mutate(
+    # Imputed counterfactual
+    Y_hat_0 = lambda_i + gamma_t,
+    # Estimated treatment effect (for treated observations)
+    tau_hat = ifelse(post == 1 & !is.infinite(treatment_year),
+                     ln_policies - Y_hat_0,
+                     NA_real_)
+  )
+
+# Display summary statistics of imputed treatment effects
+ps2_data_impute %>%
+  filter(!is.na(tau_hat)) %>%
+  summarise(
+    N = n(),
+    Mean = mean(tau_hat),
+    Median = median(tau_hat),
+    SD = sd(tau_hat),
+    Min = min(tau_hat),
+    Max = max(tau_hat)
+  ) %>%
+  mutate(across(where(is.numeric) & !N, ~round(., 4))) %>%
+  kable(caption = "Summary Statistics of Imputed Treatment Effects (τ̂)")
+```
+
+### Event Study Plot with Imputation Estimator
+
+```{r imputation-event-study}
+# Regress tau_hat on relative time indicators
+imputation_event_data <- ps2_data_impute %>%
+  filter(!is.na(tau_hat)) %>%
+  mutate(
+    rel_time_binned = case_when(
+      rel_time <= -6 ~ -6,
+      rel_time >= 6 ~ 6,
+      TRUE ~ rel_time
+    )
+  )
+
+# Run regression of tau_hat on relative time dummies
+# No fixed effects needed since tau_hat already accounts for them
+# Create factor with -1 as reference level
+imputation_event_data <- imputation_event_data %>%
+  mutate(rel_time_factor = factor(rel_time_binned))
+
+imputation_model <- lm(tau_hat ~ rel_time_factor, data = imputation_event_data)
+
+# Extract coefficients
+imputation_coefs <- broom::tidy(imputation_model, conf.int = TRUE) %>%
+  mutate(
+    rel_time = case_when(
+      term == "(Intercept)" ~ as.numeric(levels(imputation_event_data$rel_time_factor)[1]),
+      TRUE ~ as.numeric(gsub("rel_time_factor", "", term))
+    )
+  ) %>%
+  arrange(rel_time)
+
+# Plot
+ggplot(imputation_coefs, aes(x = rel_time, y = estimate)) +
+  geom_point(size = 3, color = "darkblue") +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.2, color = "darkblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = -0.5, linetype = "dotted", color = "blue") +
+  labs(
+    title = "Event Study: Imputation Estimator (Manual Implementation)",
+    subtitle = "Following Borusyak et al. (2024)",
+    x = "Years Relative to Flood",
+    y = "Treatment Effect Estimate",
+    caption = "Note: Counterfactuals estimated from never-treated and not-yet-treated units only."
+  ) +
+  theme_minimal()
+```
+
+**Interpretation:**
+
+The imputation estimator avoids using already-treated units as controls. The event study plot shows:
+
+1. **Pre-treatment effects**: Should be centered around zero (by construction, since we're using the untreated sample to estimate the counterfactual)
+
+2. **Post-treatment effects**: Show the causal impact of floods on insurance take-up
+
+3. **Comparison to TWFE**: Differences from the standard TWFE event study indicate bias from forbidden comparisons
+
+## Problem (e): ATT Estimation and Comparison
+
+### Manual ATT Estimation
+
+```{r att-manual}
+# Estimate ATT as simple average of tau_hat for treated observations
+att_manual <- ps2_data_impute %>%
+  filter(!is.na(tau_hat)) %>%
+  summarize(
+    ATT = mean(tau_hat),
+    SE_incorrect = sd(tau_hat) / sqrt(n()),
+    n_treated = n()
+  )
+
+# Display manual ATT results
+att_manual %>%
+  mutate(
+    Method = "Manual (Average of τ̂)",
+    `ATT Estimate` = round(ATT, 4),
+    `SE (Incorrect)` = round(SE_incorrect, 4),
+    `N Treated Obs` = n_treated
+  ) %>%
+  select(Method, `ATT Estimate`, `SE (Incorrect)`, `N Treated Obs`) %>%
+  kable(caption = "Manual ATT Estimation Results")
+
+# Alternative: regress tau_hat on treatment indicator (should give same result)
+att_regression <- lm(tau_hat ~ 1, data = ps2_data_impute %>% filter(!is.na(tau_hat)))
+```
+
+### ATT Using did_imputation Package
+
+```{r att-package}
+# Prepare data for did2s package
+did_data <- ps2_data %>%
+  filter(!is.infinite(treatment_year)) %>%
+  mutate(
+    first_treat = treatment_year
+  )
+
+# Estimate using did2s (Gardner 2021 implementation)
+# did2s performs two-stage estimation
+did2s_result <- did2s(
+  data = did_data,
+  yname = "ln_policies",
+  first_stage = ~ 0 | id_num + year,
+  second_stage = ~ post,
+  treatment = "post",
+  cluster_var = "state"
+)
+
+# Display did2s package results
+broom::tidy(did2s_result, conf.int = TRUE) %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  kable(caption = "did2s Package Results (Gardner 2021)")
+
+# Extract ATT - handle different possible coefficient names
+coef_names <- names(coef(did2s_result))
+att_package <- if("post" %in% coef_names) {
+  coef(did2s_result)["post"]
+} else if("post::1" %in% coef_names) {
+  coef(did2s_result)["post::1"]
+} else {
+  coef(did2s_result)[1]
+}
+
+# Extract standard error
+vcov_mat <- vcov(did2s_result)
+se_package <- if("post" %in% rownames(vcov_mat)) {
+  sqrt(vcov_mat["post", "post"])
+} else if("post::1" %in% rownames(vcov_mat)) {
+  sqrt(vcov_mat["post::1", "post::1"])
+} else {
+  sqrt(vcov_mat[1, 1])
+}
+
+# Store package results
+cat("\n")
+```
+
+### Event Study Plot with did2s
+
+```{r did2s-event-study, fig.width=10, fig.height=6}
+did_data_es <- ps2_data %>%
+  filter(!is.infinite(treatment_year))
+
+rel_time_values <- -6:6
+rel_time_values <- rel_time_values[rel_time_values != -1]
+
+did2s_es_coefs <- map_dfr(rel_time_values, function(t) {
+  did_data_es_t <- did_data_es %>%
+    mutate(treat_t = as.numeric(rel_time_binned == t))
+  
+  result <- did2s(
+    data = did_data_es_t,
+    yname = "ln_policies",
+    first_stage = ~ 0 | id_num + year,
+    second_stage = ~ treat_t,
+    treatment = "treat_t",
+    cluster_var = "state"
+  )
+  
+  coef_summary <- broom::tidy(result, conf.int = TRUE) %>%
+    filter(term == "treat_t") %>%
+    mutate(rel_time = t)
+  
+  return(coef_summary)
+}) %>%
+  bind_rows(
+    tibble(
+      term = "treat_t",
+      estimate = 0,
+      std.error = 0,
+      statistic = NA,
+      p.value = NA,
+      conf.low = 0,
+      conf.high = 0,
+      rel_time = -1
+    )
+  ) %>%
+  arrange(rel_time)
+
+ggplot(did2s_es_coefs, aes(x = rel_time, y = estimate)) +
+  geom_point(size = 3, color = "darkgreen") +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), 
+                width = 0.2, color = "darkgreen") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = -0.5, linetype = "dotted", color = "blue") +
+  labs(
+    title = "Event Study: did2s Estimator (Gardner 2021)",
+    subtitle = "Two-stage difference-in-differences with proper controls",
+    x = "Years Relative to Flood",
+    y = "Treatment Effect Estimate",
+    caption = "Note: Estimates from did2s package with state-level clustering.\nPeriod -1 omitted as reference. Endpoints binned at -6 and +6."
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    axis.title = element_text(size = 11)
+  )
+```
+
+### Comparison and Discussion
+
+```{r comparison}
+# Create comprehensive comparison table
+tibble(
+  Method = c("Manual Implementation", "Package (did2s)"),
+  `ATT Estimate` = c(att_manual$ATT, att_package),
+  `Standard Error` = c(att_manual$SE_incorrect, se_package),
+  `SE Note` = c("Incorrect (naive)", "Correct (clustered)")
+) %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  kable(caption = "Comparison of ATT Estimates")
+
+# Additional diagnostics
+tibble(
+  Metric = c("Absolute difference in ATT estimates", "SE ratio (manual/package)"),
+  Value = c(
+    round(abs(att_manual$ATT - att_package), 4),
+    round(att_manual$SE_incorrect / se_package, 2)
+  )
+) %>%
+  kable(caption = "Estimation Diagnostics")
+```
+
+**Discussion:**
+
+1. **Do we get the same ATT estimate?**
+   - The ATT estimates should be very similar (potentially with small numerical differences due to implementation details)
+   - Both methods use the same underlying logic: estimate counterfactuals from untreated units
+
+2. **Why are the manual standard errors incorrect?**
+
+   The manual approach (simply taking sd(τ̂)/√n) is incorrect because:
+
+   a) **Estimation uncertainty**: We're using *estimated* fixed effects (λ̂ᵢ, γ̂ₜ) rather than true values. The simple formula doesn't account for uncertainty in these first-stage estimates.
+
+   b) **Correlation structure**: Treatment effects τ̂ᵢₜ are not independent - they share common estimated fixed effects, inducing correlation.
+
+   c) **Clustering**: The package correctly accounts for clustering (at state level), which the manual SE ignores.
+
+   The package uses proper asymptotic theory or bootstrap methods to compute standard errors that account for the two-stage estimation procedure.
+
+## Results Summary
+
+### Key Findings
+
+1. **Event Study (TWFE)**: [Describe pattern of coefficients - pre-trends, post-treatment effects]
+
+2. **Bacon Decomposition**: [Summarize weights on different comparison types and potential for bias]
+
+3. **Imputation Estimator**: [Compare results to TWFE, discuss robustness]
+
+4. **ATT Estimates**: [Report final estimates with correct standard errors]
+
+## Conclusion
+
+This analysis demonstrates the application of modern difference-in-differences methods to study the effect of flood experience on insurance take-up. Key methodological insights:
+
+1. **Staggered DiD complications**: The Bacon decomposition reveals how TWFE estimators can be biased when treatment timing varies and effects are heterogeneous.
+
+2. **Imputation methods**: Newer estimators like Borusyak et al. (2024) avoid problematic comparisons by only using not-yet-treated units as controls.
+
+3. **Inference**: Proper standard errors must account for the two-stage estimation procedure and clustering structure.
+
+4. **Practical importance**: In this application, [discuss whether standard and robust methods give similar or different conclusions].
