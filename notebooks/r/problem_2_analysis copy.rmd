@@ -93,6 +93,51 @@ save_table <- function(data, filename, caption = "", label = "") {
   
   cat("Table saved to:", filepath, "\n")
 }
+
+# Function to run event study regression with binning
+run_event_study <- function(data, min_bin = -10, max_bin = 10, 
+                           cluster_var = "state", ref_period = -1) {
+  # Work on a copy to avoid modifying original data
+  data_copy <- data
+  
+  # Create binned relative time variable name
+  binned_var_name <- paste0("rel_time_binned_", abs(min_bin), "_", abs(max_bin))
+  
+  # Create binned relative time variable in the copy
+  data_copy <- data_copy %>%
+    mutate(
+      !!binned_var_name := case_when(
+        !ever_treated ~ 0,  # Never-treated units get 0
+        ever_treated & rel_time < min_bin ~ min_bin,
+        ever_treated & rel_time > max_bin ~ max_bin,
+        ever_treated ~ rel_time
+      )
+    )
+  
+  # Construct formula
+  formula_str <- paste0(
+    "ln_policies ~ i(", binned_var_name, ", ever_treated, ref = ", ref_period, ") | id_num + state_year"
+  )
+  event_study_formula <- as.formula(formula_str)
+  
+  # Handle clustering: can be single variable or formula string like "state + year"
+  if (grepl("\\+", cluster_var)) {
+    # Multiple clustering variables
+    cluster_formula <- as.formula(paste0("~", cluster_var))
+  } else {
+    # Single clustering variable
+    cluster_formula <- as.formula(paste0("~", cluster_var))
+  }
+  
+  # Fit model
+  model <- feols(
+    event_study_formula,
+    data = data_copy,
+    cluster = cluster_formula
+  )
+  
+  return(model)
+}
 ```
 
 ## Load Data
@@ -215,38 +260,20 @@ ps2_data %>%
 ```
 
 ```{r event-study-regression}
-# Create relative time dummies with binning
-# Binning strategy matches event_study_merged.R
-ps2_data <- ps2_data %>%
-  mutate(
-    rel_time_binned = case_when(
-      !ever_treated ~ 0,  # Never-treated units get 0 (will be absorbed by interaction)
-      ever_treated & rel_time < -10 ~ -10,
-      ever_treated & rel_time > 10 ~ 10,
-      ever_treated ~ rel_time
-    )
-  )
-
-
 # Event study regression with community and state-by-year fixed effects
-# Using fixest with unit and state-by-year fixed effects
-# Interaction with ever_treated uses never-treated units as control group
-event_study_formula <- as.formula(paste(
-  "ln_policies ~ ",
-  paste0("i(rel_time_binned, ever_treated, ref = -1)"),
-  " | id_num + state_year"
-))
-
-event_study_model <- feols(
-  event_study_formula,
+# Using the run_event_study function with binning at ±10
+event_study_model <- run_event_study(
   data = ps2_data,
-  cluster = ~ state  # Cluster by state as in Gallagher (2014)
+  min_bin = -11,
+  max_bin = 11,
+  cluster_var = "state",
+  ref_period = -1
 )
 
 # Display model summary
-broom::tidy(event_study_model, conf.int = TRUE) %>%
-  mutate(across(where(is.numeric), ~round(., 4))) %>%
-  kable(caption = "Event Study Regression Results")
+# broom::tidy(event_study_model, conf.int = TRUE) %>%
+#   mutate(across(where(is.numeric), ~round(., 4))) %>%
+#   kable(caption = "Event Study Regression Results")
 
 # Extract coefficients for plotting
 event_study_coefs <- broom::tidy(
@@ -295,46 +322,31 @@ ggplot(event_study_coefs, aes(x = rel_time, y = estimate)) +
   )
 ```
 
-### Extended Event Study Plot (Binning at ±11)
+### Event Study Plot No Binning
 
-- This binning matches with Gallagher (2014)
+
 
 ```{r event-study-regression-extended}
-# Create relative time dummies with extended binning
-# Bin at -11 and earlier, and +11 and later
-ps2_data <- ps2_data %>%
-  mutate(
-    rel_time_binned_ext = case_when(
-      !ever_treated ~ 0,  # Never-treated units get 0 (will be absorbed by interaction)
-      ever_treated & rel_time <= -11 ~ -11,
-      ever_treated & rel_time >= 11 ~ 11,
-      ever_treated ~ rel_time
-    )
-  )
-
 # Event study regression with extended time window
-event_study_formula_ext <- as.formula(paste(
-  "ln_policies ~ ",
-  paste0("i(rel_time_binned_ext, ever_treated, ref = -1)"),
-  " | id_num + state_year"
-))
-
-event_study_model_ext <- feols(
-  event_study_formula_ext,
+# Using the run_event_study function with binning at ±11
+event_study_model_ext <- run_event_study(
   data = ps2_data,
-  cluster = ~ state
+  min_bin = -999,
+  max_bin = 999,
+  cluster_var = "state",
+  ref_period = -1
 )
 
 # Extract coefficients for plotting
 event_study_coefs_ext <- broom::tidy(event_study_model_ext, conf.int = TRUE) %>%
-  filter(grepl("rel_time_binned_ext", term)) %>%
+  filter(grepl("rel_time_binned", term)) %>%
   mutate(
     rel_time = as.numeric(gsub(".*::([-0-9]+).*", "\\1", term))
   ) %>%
   # Add the omitted period (-1) with coefficient 0
   bind_rows(
     tibble(
-      term = "rel_time_binned_ext::-1",
+      term = "rel_time_binned::-1",
       estimate = 0,
       std.error = 0,
       statistic = NA,
@@ -390,24 +402,28 @@ Key interpretations:
 
 ```{r clustering-discussion}
 # State-level clustering (Gallagher's choice)
-model_state_cluster <- feols(
-  event_study_formula,
+n_bins = 11
+model_state_cluster <- run_event_study(
   data = ps2_data,
-  cluster = ~ state
+  min_bin = -n_bins,
+  max_bin = n_bins,
+  cluster_var = "state"
 )
 
 # Community-level clustering
-model_community_cluster <- feols(
-  event_study_formula,
+model_community_cluster <- run_event_study(
   data = ps2_data,
-  cluster = ~ id_num
+  min_bin = -n_bins,
+  max_bin = n_bins,
+  cluster_var = "id_num"
 )
 
 # Two-way clustering (state and year)
-model_twoway_cluster <- feols(
-  event_study_formula,
+model_twoway_cluster <- run_event_study(
   data = ps2_data,
-  cluster = ~ state + year
+  min_bin = -n_bins,
+  max_bin = n_bins,
+  cluster_var = "state + year"
 )
 
 # Compare standard errors across different clustering approaches
@@ -451,43 +467,21 @@ clustering_plot_data <- clustering_comparison %>%
   arrange(Clustering, rel_time)
 
 # Plot 1: Confidence intervals comparison
-# p1 <- ggplot(clustering_plot_data, aes(x = rel_time, y = estimate, color = Clustering)) +
-#   geom_point(position = position_dodge(width = 0.3), size = 2) +
-#   geom_errorbar(aes(ymin = conf.low, ymax = conf.high), 
-#                 position = position_dodge(width = 0.3), 
-#                 width = 0.2, alpha = 0.7) +
-#   geom_hline(yintercept = 0, linetype = "dashed", color = "gray30") +
-#   geom_vline(xintercept = -0.5, linetype = "dotted", color = "gray50") +
-#   scale_color_manual(values = c("State" = "#E41A1C", 
-#                                 "Community" = "#377EB8", 
-#                                 "State + Year" = "#4DAF4A")) +
-#   labs(
-#     title = "Comparison of Confidence Intervals by Clustering Method",
-#     subtitle = "Wider intervals indicate larger standard errors",
-#     x = "Years Relative to Flood",
-#     y = "Coefficient Estimate",
-#     color = "Clustering"
-#   ) +
-#   theme_minimal() +
-#   theme(
-#     plot.title = element_text(face = "bold", size = 13),
-#     legend.position = "bottom"
-#   )
-
-# Plot 2: Standard errors comparison
-p2 <- clustering_plot_data %>%
-  filter(rel_time != -1) %>%  # Omit reference period
-  ggplot(aes(x = rel_time, y = std.error, color = Clustering, group = Clustering)) +
-  geom_line(linewidth = 1) +
-  geom_point(size = 2.5) +
+p1 <- ggplot(clustering_plot_data, aes(x = rel_time, y = estimate, color = Clustering)) +
+  geom_point(position = position_dodge(width = 0.3), size = 2) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), 
+                position = position_dodge(width = 0.3), 
+                width = 0.2, alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray30") +
+  geom_vline(xintercept = -0.5, linetype = "dotted", color = "gray50") +
   scale_color_manual(values = c("State" = "#E41A1C", 
                                 "Community" = "#377EB8", 
                                 "State + Year" = "#4DAF4A")) +
   labs(
-    title = "Standard Errors by Clustering Method",
-    subtitle = "Direct comparison of uncertainty across methods",
+    title = "Comparison of Confidence Intervals by Clustering Method",
+    subtitle = "Wider intervals indicate larger standard errors",
     x = "Years Relative to Flood",
-    y = "Standard Error",
+    y = "Coefficient Estimate",
     color = "Clustering"
   ) +
   theme_minimal() +
@@ -495,11 +489,7 @@ p2 <- clustering_plot_data %>%
     plot.title = element_text(face = "bold", size = 13),
     legend.position = "bottom"
   )
-
-# Display both plots
-# print(p1)
-print(p2)
-
+print(p1)
 # Summary statistics of standard errors by clustering method
 clustering_plot_data %>%
   filter(rel_time != -1) %>%
@@ -662,36 +652,35 @@ ps2_data %>% filter(post == 0 )
 ```{r imputation-manual}
 # Step 1: Estimate fixed effects using only untreated observations
 # Untreated observations are those where post == 0 (not yet treated or never treated)
-
-untreated_data <- ps2_data %>% filter(post == 0 )
+untreated_data <- ps2_data %>% filter(post == 0)
 fe_model_untreated <- feols(
-  ln_policies ~ 1 | id_num + year,
+  ln_policies ~ 1 | id_num + state_year,
   data = untreated_data
 )
 
 # Step 2: Extract fixed effects
 unit_fes <- fixef(fe_model_untreated)$id_num
-time_fes <- fixef(fe_model_untreated)$year
+time_fes <- fixef(fe_model_untreated)$state_year
 
-# Create data frames for merging
 unit_fe_df <- tibble(
   id_num = as.numeric(names(unit_fes)),
   lambda_i = as.numeric(unit_fes)
 )
 time_fe_df <- tibble(
-  year = as.numeric(names(time_fes)),
+  state_year = as.character(names(time_fes)),
   gamma_t = as.numeric(time_fes)
 )
 
-# Step 3: For treated observations, impute counterfactual Y(0)
+# Step 3: For all observations, compute imputed counterfactual Y(0)
+# tau_hat will be computed for all observations (both pre and post treatment)
+# NB: This is done so that we do the event study figure, when estimating coefficient I use only 
+# treated units
 ps2_data_impute <- ps2_data %>%
   left_join(unit_fe_df, by = "id_num") %>%
-  left_join(time_fe_df, by = "year") %>%
+  left_join(time_fe_df, by = "state_year") %>%
   mutate(
     Y_hat_0 = lambda_i + gamma_t,
-    tau_hat = ifelse(post == 1,
-                     ln_policies - Y_hat_0,
-                     NA_real_)
+    tau_hat = ln_policies - Y_hat_0
   )
 
 ps2_data_impute %>%
@@ -710,37 +699,38 @@ ps2_data_impute %>%
 
 ### Event Study Plot with Imputation Estimator
 
-To create the event study plot calculate the $\tua$ for all observations (not just treated)
+Second stage: regress tau_hat on event-time dummies. 
+Note here we use $\Sigma_0 \cap \Sigma_1$ (post treatment, and pre treatment) so that we can also see the pre-treatment effects. 
+We discard observations with that
 
 ```{r imputation-event-study}
+# Keep only treated units and add binned relative time
 imputation_event_data <- ps2_data_impute %>%
-  filter(!is.infinite(treatment_year)) %>%
+  # filter(ever_treated == TRUE) %>%
   mutate(
-    tau_hat_all = ln_policies - Y_hat_0,
     rel_time_binned = case_when(
-      rel_time <= -10 ~ -10,
-      rel_time >= 10 ~ 10,
+      rel_time < -10 ~ -10,
+      rel_time > 10 ~ 10,
       TRUE ~ rel_time
     )
   ) %>%
-  filter(!is.na(tau_hat_all) & !is.na(rel_time_binned))
+  filter(is.finite(tau_hat) & !is.na(rel_time_binned))
 
-rel_time_values <- sort(unique(imputation_event_data$rel_time_binned))
-rel_time_values <- rel_time_values[rel_time_values != -1]
+m_imp <- feols(
+  tau_hat ~ i(rel_time_binned, ref = -1),
+  data = imputation_event_data,
+  cluster = ~ state
+)
 
-imputation_coefs <- map_dfr(rel_time_values, function(t) {
-  data_t <- imputation_event_data %>%
-    mutate(treat_t = as.numeric(rel_time_binned == t))
-  
-  model <- lm(tau_hat_all ~ treat_t, data = data_t)
-  
-  broom::tidy(model, conf.int = TRUE) %>%
-    filter(term == "treat_t") %>%
-    mutate(rel_time = t)
-}) %>%
+# Extract coefficients for plotting
+imputation_coefs <- broom::tidy(m_imp, conf.int = TRUE) %>%
+  filter(grepl("rel_time_binned", term)) %>%
+  mutate(
+    rel_time = as.numeric(gsub(".*::([-0-9]+).*", "\\1", term))
+  ) %>%
   bind_rows(
     tibble(
-      term = "treat_t",
+      term = "rel_time_binned::-1",
       estimate = 0,
       std.error = 0,
       statistic = NA,
@@ -782,46 +772,64 @@ ggplot(imputation_coefs, aes(x = rel_time, y = estimate)) +
 
 The imputation estimator avoids using already-treated units as controls. The event study plot shows:
 
-1. **Pre-treatment effects**: Should be centered around zero (by construction, since we're using the untreated sample to estimate the counterfactual)
-
-2. **Post-treatment effects**: Show the causal impact of floods on insurance take-up
-
-3. **Comparison to TWFE**: Differences from the standard TWFE event study indicate bias from forbidden comparisons
+1. **Pre-treatment effects**: Pre treatment coefficients are not different from zero, supporting parallel trends
+2. **Post-treatment effects**: A similar post-treatment effect pattern as TWFE, but potentially more reliable due to avoiding forbidden comparisons
+3. **Comparison to TWFE**: There is no siginificant difference in the pattern when compared to TWFE, suggesting limited bias from forbidden comparisons in this case. As we might have quessed from the Bacon decomposition.
 
 ## Problem (e): ATT Estimation and Comparison
 
+
+
 ### Manual ATT Estimation
+
+For manua ATT estimation, we take the simple average of the imputed treatment effects (tau_hat) for treated observations only (i.e. those with post == 1).
+Thus, naturally, we disrecard observations that are treated in the start of the sample (no pre-treatment data) as these don't have valid tau_hat.
 
 ```{r att-manual}
 # Estimate ATT as simple average of tau_hat for treated observations
 att_manual <- ps2_data_impute %>%
-  filter(!is.na(tau_hat)) %>%
+  filter(post == 1, !is.na(tau_hat)) %>%
   summarize(
     ATT = mean(tau_hat),
     SE_incorrect = sd(tau_hat) / sqrt(n()),
     n_treated = n()
   )
 
-# Display manual ATT results
-att_manual %>%
-  mutate(
-    Method = "Manual (Average of τ̂)",
-    `ATT Estimate` = round(ATT, 4),
-    `SE (Incorrect)` = round(SE_incorrect, 4),
-    `N Treated Obs` = n_treated
-  ) %>%
-  select(Method, `ATT Estimate`, `SE (Incorrect)`, `N Treated Obs`) %>%
-  kable(caption = "Manual ATT Estimation Results")
-
 # Alternative: regress tau_hat on treatment indicator (should give same result)
-att_regression <- lm(tau_hat ~ 1, data = ps2_data_impute %>% filter(!is.na(tau_hat)))
+att_regression <- feols(
+  tau_hat ~ 1,
+  cluster = ~ state, 
+  data = ps2_data_impute %>% filter(post == 1, !is.na(tau_hat))
+)
+
+# Extract regression results using broom
+att_reg_tidy <- broom::tidy(att_regression, conf.int = TRUE)
+
+# Display manual ATT results - both methods
+bind_rows(
+  att_manual %>%
+    mutate(
+      Method = "Manual (Simple Average of τ̂)",
+      `ATT Estimate` = ATT,
+      `SE (Incorrect)` = SE_incorrect,
+      `N Treated Obs` = n_treated
+    ) %>%
+    select(Method, `ATT Estimate`, `SE (Incorrect)`, `N Treated Obs`),
+  tibble(
+    Method = "Manual (Regression on constant, clustered)",
+    `ATT Estimate` = att_reg_tidy$estimate[1],
+    `SE (Incorrect)` = att_reg_tidy$std.error[1],
+    `N Treated Obs` = nobs(att_regression)
+  )
+) %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  kable(caption = "Manual ATT Estimation Results (Both Methods Should Match)")
 ```
 
 ### ATT Using did_imputation Package
 
 ```{r att-package-didimputation}
-did_imputation_data <- ps2_data %>%
-  filter(!is.infinite(treatment_year))
+did_imputation_data <- ps2_data
 
 dimp_result <- did_imputation(
   data = did_imputation_data,
@@ -829,7 +837,7 @@ dimp_result <- did_imputation(
   gname = "treatment_year",
   tname = "year",
   idname = "id_num",
-  first_stage = ~ 0 | id_num + year,
+  first_stage = ~ 0 | id_num + state_year,
   cluster_var = "state"
 )
 
@@ -841,14 +849,12 @@ dimp_result %>%
 att_dimp <- mean(dimp_result$estimate, na.rm = TRUE)
 se_dimp <- mean(dimp_result$std.error, na.rm = TRUE)
 
-cat("\n")
 ```
 
 ### Event Study Plot with did_imputation
 
 ```{r didimputation-event-study, fig.width=10, fig.height=6}
-dimp_es_data <- ps2_data %>%
-  filter(!is.infinite(treatment_year))
+dimp_es_data <- ps2_data # %>%  filter(!is.infinite(treatment_year))
 
 dimp_es_result <- did_imputation(
   data = dimp_es_data,
@@ -861,6 +867,10 @@ dimp_es_result <- did_imputation(
   pretrends = TRUE,
   cluster_var = "state"
 )
+
+```
+
+```{r didimputation-event-study-plot}
 
 dimp_es_coefs <- dimp_es_result %>%
   as.data.frame() %>%
@@ -891,31 +901,33 @@ ggplot(dimp_es_coefs, aes(x = rel_time, y = estimate)) +
     plot.subtitle = element_text(size = 11),
     axis.title = element_text(size = 11)
   )
-```
 
+```
 ### Comparison and Discussion
+
+
 
 ```{r comparison}
 # Create comprehensive comparison table
 tibble(
-  Method = c("Manual Implementation", "Package (did2s)", "Package (did_imputation)"),
-  `ATT Estimate` = c(att_manual$ATT, att_package, att_dimp),
-  `Standard Error` = c(att_manual$SE_incorrect, se_package, se_dimp),
+  Method = c("Manual Implementation", "Manual Implementation (clustered)", "Package (did_imputation)"),
+  `ATT Estimate` = c(att_manual$ATT, att_reg_tidy$estimate[1], att_dimp),
+  `Standard Error` = c(att_manual$SE_incorrect, att_reg_tidy$std.error[1], se_dimp),
   `SE Note` = c("Incorrect (naive)", "Correct (clustered)", "Correct (clustered)")
-) %>%
+)  %>%
   mutate(across(where(is.numeric), ~round(., 4))) %>%
   kable(caption = "Comparison of ATT Estimates") %>%
-  footnote(general = "did2s: Gardner (2021); did_imputation: Borusyak et al. (2024)")
+  footnote(general = "did_imputation: Borusyak et al. (2024)") 
 
 # Additional diagnostics
-tibble(
-  Metric = c("Absolute difference in ATT estimates", "SE ratio (manual/package)"),
-  Value = c(
-    round(abs(att_manual$ATT - att_package), 4),
-    round(att_manual$SE_incorrect / se_package, 2)
-  )
-) %>%
-  kable(caption = "Estimation Diagnostics")
+# tibble(
+#   Metric = c("Absolute difference in ATT estimates", "SE ratio (manual/package)"),
+#   Value = c(
+#     round(abs(att_manual$ATT - att_dimp), 4),
+#     round(att_manual$SE_incorrect / se_dimp, 2)
+#   )
+# ) %>%
+#   kable(caption = "Estimation Diagnostics")
 ```
 
 **Discussion:**
