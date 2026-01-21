@@ -27,29 +27,20 @@ This document contains analysis for Financial Econometrics II.
 ## Load Libraries
 
 ```{r load-libraries}
-# Install packages if they don't exist
-required_packages <- c("tidyverse", "haven", "knitr", "kableExtra", "here")
-new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
-if(length(new_packages)) install.packages(new_packages)
+required_packages <- c(
+  "tidyverse", "haven", "knitr", "kableExtra", "here",
+  "ggplot2", "bacondecomp", "fixest", "did", "did2s", "didimputation"
+)
 
-
-packages <- c("bacondecomp", "fixest", "did", "did2s", "didimputation")
-for (pkg in packages) {
-  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
-    install.packages(pkg, repos = "https://cloud.r-project.org")
-    library(pkg, character.only = TRUE)
-  }
+new_packages <- required_packages[!(required_packages %in% 
+                                    installed.packages()[, "Package"])]
+if (length(new_packages)) {
+  install.packages(new_packages, repos = "https://cloud.r-project.org")
 }
 
-
-# Load libraries
-library(tidyverse)
-library(haven)
-library(knitr)
-library(kableExtra)
-library(here)
-library(ggplot2)
+invisible(lapply(required_packages, library, character.only = TRUE))
 ```
+
 
 ## Helper Functions
 
@@ -161,9 +152,6 @@ tibble(
 ### Create Relative Time Variables
 
 ```{r create-relative-time}
-# Install and load packages
-
-
 # Create treatment year variable
 ps2_data <- ps2_data %>%
   group_by(id_num) %>%
@@ -171,14 +159,20 @@ ps2_data <- ps2_data %>%
     treatment_year = ifelse(any(hityear == 1),
                            year[which(hityear == 1)[1]],
                            Inf),
-    # Relative time to treatment
     rel_time = year - treatment_year,
-    # Post treatment indicator
     post = as.numeric(year >= treatment_year),
-    # Never treated indicator
-    never_treated = is.infinite(treatment_year)
+    never_treated = is.infinite(treatment_year),
+    ever_treated = !is.infinite(treatment_year)
   ) %>%
-  ungroup()
+  ungroup() %>%
+  mutate(
+    state_year = interaction(state, year, drop = TRUE)
+  )
+
+# Drop units treated in the first period (no pre-treatment data)
+t0 <- min(ps2_data$year, na.rm = TRUE)
+ps2_data <- ps2_data %>%
+  filter(is.infinite(treatment_year) | treatment_year > t0)
 
 # Check distribution of treatment timing
 treatment_timing <- ps2_data %>%
@@ -187,43 +181,65 @@ treatment_timing <- ps2_data %>%
   count(treatment_year) %>%
   rename(`Treatment Year` = treatment_year, `Number of Communities` = n)
 
-treatment_timing %>%
-  kable(caption = "Distribution of Treatment Timing")
+# treatment_timing %>%
+#   kable(caption = "Distribution of Treatment Timing")
+support_tbl <- ps2_data %>%
+  filter(is.finite(treatment_year)) %>%
+  mutate(rel_time = year - treatment_year) %>%
+  count(rel_time) %>%
+  arrange(rel_time)
 ```
 
 ### Event Study Regression
 
 Following Baker et al. (2022) recommendations on binning, I'll create binned endpoints for the event study.
-- Use 6 bins to capture dynamics while avoiding sparse data issues.
+
+- Use 6 bins to capture dynamics while avoiding sparse data issues, and also match Gallaghers 11 bins (with 11th being the aggregate). 11 bins might still be ok, but more than that, leads to quite sparse data at the tails. Importantly, the pre and post treatment patterns remain similar with 11 vs 6 bins.
+
+- Keep the never treated communities as controls, 
+
+- NB Gallagher runs the TWFE estimat using community, and state-by-year fixed effects. The specification in the problem sheet has communit and year fixed effects. 
+
+   - In general I would choose to use state-by-year fixed effects. This is because there are likely to be many state-year level shocks (e.g. regulation changes affecting insurance) that are not absorbed by year fixed effects alone.
+
+   - Using state-by-year fixed effects, identification then comes from variation between communities within the same state-year (i.e., comparing hit vs not-hit communities inside the same state and year).
+
+   - However, to stay consistent with the problem sheet, and the fact that the Bacon decomposition by defualt doens't support year-by-state fixed effects, I will use community and year fixed effects here.
+
+```{r rel-time-hist}
+# To check the validity for binning
+ps2_data %>%
+  filter(is.finite(treatment_year)) %>%
+  mutate(rel_time = year - treatment_year)%>%
+  .$rel_time %>% hist()
+```
 
 ```{r event-study-regression}
 # Create relative time dummies with binning
-# Bin at -6 and earlier, and +6 and later
+# Binning strategy matches event_study_merged.R
 ps2_data <- ps2_data %>%
   mutate(
     rel_time_binned = case_when(
-      is.infinite(treatment_year) ~ NA_real_,
-      rel_time <= -6 ~ -6,
-      rel_time >= 6 ~ 6,
-      TRUE ~ rel_time
+      !ever_treated ~ 0,  # Never-treated units get 0 (will be absorbed by interaction)
+      ever_treated & rel_time < -10 ~ -10,
+      ever_treated & rel_time > 10 ~ 10,
+      ever_treated ~ rel_time
     )
   )
 
-# Create dummy variables for each relative time (omit -1 as base period)
-rel_time_range <- -6:6
-rel_time_range <- rel_time_range[rel_time_range != -1]  # Omit -1 as base
 
-# Event study regression with community and year fixed effects
-# Using fixest for two-way fixed effects
+# Event study regression with community and state-by-year fixed effects
+# Using fixest with unit and state-by-year fixed effects
+# Interaction with ever_treated uses never-treated units as control group
 event_study_formula <- as.formula(paste(
   "ln_policies ~ ",
-  paste0("i(rel_time_binned, ref = -1)"),
-  " | id_num + year"
+  paste0("i(rel_time_binned, ever_treated, ref = -1)"),
+  " | id_num + state_year"
 ))
 
 event_study_model <- feols(
   event_study_formula,
-  data = ps2_data %>% filter(!is.infinite(treatment_year)),
+  data = ps2_data,
   cluster = ~ state  # Cluster by state as in Gallagher (2014)
 )
 
@@ -233,7 +249,8 @@ broom::tidy(event_study_model, conf.int = TRUE) %>%
   kable(caption = "Event Study Regression Results")
 
 # Extract coefficients for plotting
-event_study_coefs <- broom::tidy(event_study_model, conf.int = TRUE) %>%
+event_study_coefs <- broom::tidy(
+  event_study_model, conf.int = TRUE) %>%
   filter(grepl("rel_time", term)) %>%
   mutate(
     rel_time = as.numeric(gsub(".*::([-0-9]+).*", "\\1", term))
@@ -268,7 +285,7 @@ ggplot(event_study_coefs, aes(x = rel_time, y = estimate)) +
     subtitle = "Gallagher (2014) replication",
     x = "Years Relative to Flood",
     y = "Coefficient Estimate",
-    caption = "Note: Confidence intervals based on state-level clustering. \nPeriod -1 omitted as reference. Endpoints binned at -6 and +6."
+    caption = "Note: Confidence intervals based on state-level clustering. \nPeriod -1 omitted as reference. Endpoints binned at -10 and +10  ."
   ) +
   theme_minimal() +
   theme(
@@ -280,7 +297,7 @@ ggplot(event_study_coefs, aes(x = rel_time, y = estimate)) +
 
 ### Extended Event Study Plot (Binning at ±11)
 
-- This binning is similar to the paper
+- This binning matches with Gallagher (2014)
 
 ```{r event-study-regression-extended}
 # Create relative time dummies with extended binning
@@ -288,29 +305,29 @@ ggplot(event_study_coefs, aes(x = rel_time, y = estimate)) +
 ps2_data <- ps2_data %>%
   mutate(
     rel_time_binned_ext = case_when(
-      is.infinite(treatment_year) ~ NA_real_,
-      rel_time <= -11 ~ -11,
-      rel_time >= 11 ~ 11,
-      TRUE ~ rel_time
+      !ever_treated ~ 0,  # Never-treated units get 0 (will be absorbed by interaction)
+      ever_treated & rel_time <= -11 ~ -11,
+      ever_treated & rel_time >= 11 ~ 11,
+      ever_treated ~ rel_time
     )
   )
 
 # Event study regression with extended time window
 event_study_formula_ext <- as.formula(paste(
   "ln_policies ~ ",
-  paste0("i(rel_time_binned_ext, ref = -1)"),
-  " | id_num + year"
+  paste0("i(rel_time_binned_ext, ever_treated, ref = -1)"),
+  " | id_num + state_year"
 ))
 
 event_study_model_ext <- feols(
   event_study_formula_ext,
-  data = ps2_data %>% filter(!is.infinite(treatment_year)),
+  data = ps2_data,
   cluster = ~ state
 )
 
 # Extract coefficients for plotting
 event_study_coefs_ext <- broom::tidy(event_study_model_ext, conf.int = TRUE) %>%
-  filter(grepl("rel_time", term)) %>%
+  filter(grepl("rel_time_binned_ext", term)) %>%
   mutate(
     rel_time = as.numeric(gsub(".*::([-0-9]+).*", "\\1", term))
   ) %>%
@@ -328,6 +345,9 @@ event_study_coefs_ext <- broom::tidy(event_study_model_ext, conf.int = TRUE) %>%
     )
   ) %>%
   arrange(rel_time)
+```
+
+```{r event-study-plot-extended, fig.width=10, fig.height=6}
 
 # Create extended event study plot
 ggplot(event_study_coefs_ext, aes(x = rel_time, y = estimate)) +
@@ -369,42 +389,131 @@ Key interpretations:
 ### (b)(ii) Standard Error Clustering
 
 ```{r clustering-discussion}
-# Gallagher (2014) clusters at the state level
-# Let's compare different clustering approaches
-
 # State-level clustering (Gallagher's choice)
 model_state_cluster <- feols(
   event_study_formula,
-  data = ps2_data %>% filter(!is.infinite(treatment_year)),
+  data = ps2_data,
   cluster = ~ state
 )
 
 # Community-level clustering
 model_community_cluster <- feols(
   event_study_formula,
-  data = ps2_data %>% filter(!is.infinite(treatment_year)),
+  data = ps2_data,
   cluster = ~ id_num
 )
 
 # Two-way clustering (state and year)
 model_twoway_cluster <- feols(
   event_study_formula,
-  data = ps2_data %>% filter(!is.infinite(treatment_year)),
+  data = ps2_data,
   cluster = ~ state + year
 )
 
 # Compare standard errors across different clustering approaches
-bind_rows(
+clustering_comparison <- bind_rows(
   broom::tidy(model_state_cluster, conf.int = TRUE) %>% mutate(Clustering = "State"),
   broom::tidy(model_community_cluster, conf.int = TRUE) %>% mutate(Clustering = "Community"),
   broom::tidy(model_twoway_cluster, conf.int = TRUE) %>% mutate(Clustering = "State + Year")
-) %>%
+)
+
+clustering_comparison %>%
   select(Clustering, term, estimate, std.error, p.value) %>%
   mutate(across(c(estimate, std.error, p.value), ~round(., 4))) %>%
   filter(term != "(Intercept)") %>%
   head(15) %>%
   kable(caption = "Comparison of Standard Errors by Clustering Method (Selected Coefficients)",
         col.names = c("Clustering", "Term", "Estimate", "Std. Error", "P-value"))
+```
+
+### Visualization of Standard Error Differences
+
+```{r clustering-visualization, fig.width=10, fig.height=8}
+
+clustering_plot_data <- clustering_comparison %>%
+  filter(grepl("rel_time", term)) %>%
+  mutate(
+    rel_time = as.numeric(gsub(".*::([-0-9]+).*", "\\1", term)),
+    Clustering = factor(Clustering, levels = c("State", "Community", "State + Year"))
+  ) %>%
+  bind_rows(
+    tibble(
+      term = rep("rel_time_binned::-1", 3),
+      estimate = rep(0, 3),
+      std.error = rep(0, 3),
+      conf.low = rep(0, 3),
+      conf.high = rep(0, 3),
+      rel_time = rep(-1, 3),
+      Clustering = factor(c("State", "Community", "State + Year"), 
+                         levels = c("State", "Community", "State + Year"))
+    )
+  ) %>%
+  arrange(Clustering, rel_time)
+
+# Plot 1: Confidence intervals comparison
+# p1 <- ggplot(clustering_plot_data, aes(x = rel_time, y = estimate, color = Clustering)) +
+#   geom_point(position = position_dodge(width = 0.3), size = 2) +
+#   geom_errorbar(aes(ymin = conf.low, ymax = conf.high), 
+#                 position = position_dodge(width = 0.3), 
+#                 width = 0.2, alpha = 0.7) +
+#   geom_hline(yintercept = 0, linetype = "dashed", color = "gray30") +
+#   geom_vline(xintercept = -0.5, linetype = "dotted", color = "gray50") +
+#   scale_color_manual(values = c("State" = "#E41A1C", 
+#                                 "Community" = "#377EB8", 
+#                                 "State + Year" = "#4DAF4A")) +
+#   labs(
+#     title = "Comparison of Confidence Intervals by Clustering Method",
+#     subtitle = "Wider intervals indicate larger standard errors",
+#     x = "Years Relative to Flood",
+#     y = "Coefficient Estimate",
+#     color = "Clustering"
+#   ) +
+#   theme_minimal() +
+#   theme(
+#     plot.title = element_text(face = "bold", size = 13),
+#     legend.position = "bottom"
+#   )
+
+# Plot 2: Standard errors comparison
+p2 <- clustering_plot_data %>%
+  filter(rel_time != -1) %>%  # Omit reference period
+  ggplot(aes(x = rel_time, y = std.error, color = Clustering, group = Clustering)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("State" = "#E41A1C", 
+                                "Community" = "#377EB8", 
+                                "State + Year" = "#4DAF4A")) +
+  labs(
+    title = "Standard Errors by Clustering Method",
+    subtitle = "Direct comparison of uncertainty across methods",
+    x = "Years Relative to Flood",
+    y = "Standard Error",
+    color = "Clustering"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 13),
+    legend.position = "bottom"
+  )
+
+# Display both plots
+# print(p1)
+print(p2)
+
+# Summary statistics of standard errors by clustering method
+clustering_plot_data %>%
+  filter(rel_time != -1) %>%
+  group_by(Clustering) %>%
+  summarise(
+    `Mean SE` = mean(std.error, na.rm = TRUE),
+    `Median SE` = median(std.error, na.rm = TRUE),
+    `Min SE` = min(std.error, na.rm = TRUE),
+    `Max SE` = max(std.error, na.rm = TRUE)
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  kable(caption = "Summary Statistics of Standard Errors by Clustering Method")
+
+
 ```
 
 **Comments on Clustering Choice:**
@@ -415,11 +524,14 @@ Gallagher (2014) clusters standard errors at the state level. This choice is app
 
 2. **Treatment variation**: The treatment (floods) likely varies at a level between individual communities and states, so state-level clustering is conservative.
 
-3. **Bertrand et al. (2004) guidance**: With panel data and treatment that varies at the state-year level, clustering at the state level accounts for serial correlation and within-state correlation.
+3. With panel data and treatment that varies at the state-year level, clustering at the state level accounts for serial correlation and within-state correlation.
+
 
 **My assessment**: State-level clustering is appropriate and conservative. Alternative approaches could include:
 - Two-way clustering (state and year) to account for common time shocks
 - Community-level clustering if we believe communities are independent, but this would likely understate standard errors
+
+However, remembering the general rule "cluster at least at the level of treatment variation"
 
 I would make the same choice as Gallagher for the main results, but might show robustness to two-way clustering.
 
@@ -431,16 +543,13 @@ I would make the same choice as Gallagher for the main results, but might show r
 # Include both treated and never-treated units
 bacon_data <- ps2_data %>%
   mutate(
-    treat_year = ifelse(is.infinite(treatment_year), 0, treatment_year),
     treated = post
   )
 
-# Check if panel is balanced and balance it if needed
+# Make sure the panel is balanced, remove observations that don't appear in all periods
 panel_structure <- bacon_data %>%
   group_by(id_num) %>%
   summarize(n_periods = n(), .groups = 'drop')
-
-# Keep only units that appear in all periods
 max_periods <- max(panel_structure$n_periods)
 balanced_ids <- panel_structure %>%
   filter(n_periods == max_periods) %>%
@@ -449,17 +558,18 @@ balanced_ids <- panel_structure %>%
 bacon_data_balanced <- bacon_data %>%
   filter(id_num %in% balanced_ids)
 
-# Display panel balance information
 tibble(
   Metric = c("Original panel size", "Balanced panel size", "Number of units"),
   Value = c(nrow(bacon_data), nrow(bacon_data_balanced), length(balanced_ids))
 ) %>%
   kable(caption = "Panel Structure for Bacon Decomposition")
 
+
+# Run Bacon, Note: very slow
 # For computational feasibility, sample units if needed
 set.seed(42)
-if (length(balanced_ids) > 1000) {
-  sampled_ids <- sample(balanced_ids, 1000)
+if (length(balanced_ids) > 500) {
+  sampled_ids <- sample(balanced_ids, 500)
   bacon_data_final <- bacon_data_balanced %>%
     filter(id_num %in% sampled_ids)
   cat("Sampling to", length(sampled_ids), "units for computational feasibility\n")
@@ -467,14 +577,15 @@ if (length(balanced_ids) > 1000) {
   bacon_data_final <- bacon_data_balanced
 }
 
-# Run Bacon decomposition
-# Note: bacon requires a balanced panel and specific data structure
 bacon_decomp <- bacon(
   ln_policies ~ treated,
   data = bacon_data_final,
   id_var = "id_num",
   time_var = "year"
 )
+```
+
+```{r bacon-summary}
 
 # Summarize decomposition
 bacon_decomp %>%
@@ -489,6 +600,21 @@ bacon_decomp %>%
   mutate(across(where(is.numeric), ~round(., 4))) %>%
   kable(caption = "Bacon-Goodman Decomposition Summary")
 
+bacon_summary <- bacon_decomp %>%
+  group_by(type) %>%
+  summarize(
+    total_weight = sum(weight),
+    avg_estimate = weighted.mean(estimate, weight),
+    n_comparisons = n(),
+    .groups = 'drop'
+  )
+
+print(bacon_summary)
+
+
+```
+
+```{r bacon plot}
 # Visualize decomposition
 ggplot(bacon_decomp, aes(x = weight, y = estimate, shape = type, color = type)) +
   geom_point(size = 3) +
@@ -503,67 +629,10 @@ ggplot(bacon_decomp, aes(x = weight, y = estimate, shape = type, color = type)) 
   ) +
   theme_minimal() +
   theme(legend.position = "bottom")
-
-# Calculate aggregate statistics
-bacon_summary <- bacon_decomp %>%
-  group_by(type) %>%
-  summarize(
-    total_weight = sum(weight),
-    avg_estimate = weighted.mean(estimate, weight),
-    n_comparisons = n(),
-    .groups = 'drop'
-  )
-
-print(bacon_summary)
 ```
 
 ### Interpretation of Bacon Decomposition
 
-```{r bacon-interpretation}
-# Extract late-to-early comparisons
-late_to_early_data <- bacon_decomp %>%
-  filter(type == "Later vs Earlier Treated") %>%
-  filter(!is.na(estimate) & !is.na(weight))
-
-# Check if there are any late-to-early comparisons
-if (nrow(late_to_early_data) > 0) {
-  late_to_early <- late_to_early_data %>%
-    summarize(
-      weight = sum(weight, na.rm = TRUE),
-      att = sum(estimate * weight, na.rm = TRUE) / sum(weight, na.rm = TRUE),
-      .groups = 'drop'
-    )
-  
-  # Create results table
-  results_df <- bind_rows(
-    bacon_summary %>% mutate(Category = "By Type"),
-    late_to_early %>% 
-      mutate(type = "Late-to-Early", Category = "Specific") %>%
-      rename(total_weight = weight, avg_estimate = att) %>%
-      mutate(n_comparisons = NA)
-  ) %>%
-    select(Category, type, n_comparisons, total_weight, avg_estimate) %>%
-    mutate(across(where(is.numeric), ~round(., 4)))
-  
-  results_df %>%
-    kable(caption = "Bacon Decomposition Results",
-          col.names = c("Category", "Type", "N Comparisons", "Total Weight", "Avg Estimate"))
-} else {
-  bacon_summary %>%
-    mutate(across(where(is.numeric), ~round(., 4))) %>%
-    kable(caption = "Bacon Decomposition Results (No Late-to-Early Comparisons Found)")
-  
-  cat("\n**Note:** No 'Later vs Earlier Treated' comparisons found. This can occur if all treated units are treated at the same time or the sample doesn't include staggered treatment timing.\n")
-}
-
-# Display aggregate TWFE estimate
-twfe_aggregate <- sum(bacon_decomp$estimate * bacon_decomp$weight, na.rm = TRUE)
-tibble(
-  Estimate = "Aggregate TWFE",
-  Value = round(twfe_aggregate, 4)
-) %>%
-  kable()
-```
 
 **Interpretation:**
 
@@ -576,27 +645,32 @@ The Bacon-Goodman decomposition reveals potential problems with the standard TWF
 3. **Direction of bias**: If treatment effects grow over time, the late-to-early ATT may be biased, potentially even having the wrong sign relative to the true effect.
 
 Given the estimates and high weight on "Treated vs Untreated" expect the results to be quite robust. However, there is 
+
+
+
 ## Problem (d): Imputation Estimator by Hand
 
-Following Borusyak et al. (2024), I'll implement the imputation estimator manually.
+Following Borusyak et al. (2024), I'll implement the imputation estimator manually. In steps
+
+1. Estimate fixed effects for community, year (this consistent with the earlier), not year-by-state
+2. 
+
+```{r temp}
+ps2_data %>% filter(post == 0 )
+```
 
 ```{r imputation-manual}
 # Step 1: Estimate fixed effects using only untreated observations
 # Untreated observations are those where post == 0 (not yet treated or never treated)
 
-untreated_data <- ps2_data %>%
-  filter(post == 0 | is.infinite(treatment_year))
-
-# Estimate unit and time fixed effects on untreated sample
+untreated_data <- ps2_data %>% filter(post == 0 )
 fe_model_untreated <- feols(
   ln_policies ~ 1 | id_num + year,
   data = untreated_data
 )
 
 # Step 2: Extract fixed effects
-# Get unit fixed effects (lambda_i)
 unit_fes <- fixef(fe_model_untreated)$id_num
-# Get time fixed effects (gamma_t)
 time_fes <- fixef(fe_model_untreated)$year
 
 # Create data frames for merging
@@ -604,7 +678,6 @@ unit_fe_df <- tibble(
   id_num = as.numeric(names(unit_fes)),
   lambda_i = as.numeric(unit_fes)
 )
-
 time_fe_df <- tibble(
   year = as.numeric(names(time_fes)),
   gamma_t = as.numeric(time_fes)
@@ -615,15 +688,12 @@ ps2_data_impute <- ps2_data %>%
   left_join(unit_fe_df, by = "id_num") %>%
   left_join(time_fe_df, by = "year") %>%
   mutate(
-    # Imputed counterfactual
     Y_hat_0 = lambda_i + gamma_t,
-    # Estimated treatment effect (for treated observations)
-    tau_hat = ifelse(post == 1 & !is.infinite(treatment_year),
+    tau_hat = ifelse(post == 1,
                      ln_policies - Y_hat_0,
                      NA_real_)
   )
 
-# Display summary statistics of imputed treatment effects
 ps2_data_impute %>%
   filter(!is.na(tau_hat)) %>%
   summarise(
@@ -640,14 +710,16 @@ ps2_data_impute %>%
 
 ### Event Study Plot with Imputation Estimator
 
+To create the event study plot calculate the $\tua$ for all observations (not just treated)
+
 ```{r imputation-event-study}
 imputation_event_data <- ps2_data_impute %>%
   filter(!is.infinite(treatment_year)) %>%
   mutate(
     tau_hat_all = ln_policies - Y_hat_0,
     rel_time_binned = case_when(
-      rel_time <= -6 ~ -6,
-      rel_time >= 6 ~ 6,
+      rel_time <= -10 ~ -10,
+      rel_time >= 10 ~ 10,
       TRUE ~ rel_time
     )
   ) %>%
@@ -679,6 +751,9 @@ imputation_coefs <- map_dfr(rel_time_values, function(t) {
     )
   ) %>%
   arrange(rel_time)
+```
+
+```{r imputation-event-study-plot, fig.width=10, fig.height=6}
 
 ggplot(imputation_coefs, aes(x = rel_time, y = estimate)) +
   geom_point(size = 3, color = "darkblue") +
@@ -699,7 +774,9 @@ ggplot(imputation_coefs, aes(x = rel_time, y = estimate)) +
     plot.subtitle = element_text(size = 11),
     axis.title = element_text(size = 11)
   )
+
 ```
+
 
 **Interpretation:**
 
@@ -738,127 +815,6 @@ att_manual %>%
 
 # Alternative: regress tau_hat on treatment indicator (should give same result)
 att_regression <- lm(tau_hat ~ 1, data = ps2_data_impute %>% filter(!is.na(tau_hat)))
-```
-
-### ATT Using did2s Package
-
-```{r att-package-did2s}
-# Prepare data for did2s package
-did_data <- ps2_data %>%
-  filter(!is.infinite(treatment_year)) %>%
-  mutate(
-    first_treat = treatment_year
-  )
-
-# Estimate using did2s (Gardner 2021 implementation)
-# did2s performs two-stage estimation
-did2s_result <- did2s(
-  data = did_data,
-  yname = "ln_policies",
-  first_stage = ~ 0 | id_num + year,
-  second_stage = ~ post,
-  treatment = "post",
-  cluster_var = "state"
-)
-
-# Display did2s package results
-broom::tidy(did2s_result, conf.int = TRUE) %>%
-  mutate(across(where(is.numeric), ~round(., 4))) %>%
-  kable(caption = "did2s Package Results (Gardner 2021)")
-
-# Extract ATT - handle different possible coefficient names
-coef_names <- names(coef(did2s_result))
-att_package <- if("post" %in% coef_names) {
-  coef(did2s_result)["post"]
-} else if("post::1" %in% coef_names) {
-  coef(did2s_result)["post::1"]
-} else {
-  coef(did2s_result)[1]
-}
-
-# Extract standard error
-vcov_mat <- vcov(did2s_result)
-se_package <- if("post" %in% rownames(vcov_mat)) {
-  sqrt(vcov_mat["post", "post"])
-} else if("post::1" %in% rownames(vcov_mat)) {
-  sqrt(vcov_mat["post::1", "post::1"])
-} else {
-  sqrt(vcov_mat[1, 1])
-}
-
-# Store package results
-cat("\n")
-```
-
-### Event Study Plot with did2s
-
-```{r did2s-event-study, fig.width=10, fig.height=6}
-# # Prepare data with all necessary variables
-# did_data_es <- ps2_data %>%
-#   filter(!is.infinite(treatment_year)) %>%
-#   mutate(
-#     rel_time_binned = case_when(
-#       rel_time <= -6 ~ -6,
-#       rel_time >= 6 ~ 6,
-#       TRUE ~ rel_time
-#     )
-#   )
-
-# rel_time_values <- -6:6
-# rel_time_values <- rel_time_values[rel_time_values != -1]
-
-# did2s_es_coefs <- map_dfr(rel_time_values, function(t) {
-#   did_data_es_t <- did_data_es %>%
-#     mutate(treat_t = as.logical(rel_time_binned == t))
-  
-#   result <- did2s(
-#     data = did_data_es_t,
-#     yname = "ln_policies",
-#     first_stage = ~ 0 | id_num + year,
-#     second_stage = ~ treat_t,
-#     treatment = "treat_t",
-#     cluster_var = "state"
-#   )
-  
-#   coef_summary <- broom::tidy(result, conf.int = TRUE) %>%
-#     filter(term == "treat_t") %>%
-#     mutate(rel_time = t)
-  
-#   return(coef_summary)
-# }) %>%
-#   bind_rows(
-#     tibble(
-#       term = "treat_t",
-#       estimate = 0,
-#       std.error = 0,
-#       statistic = NA,
-#       p.value = NA,
-#       conf.low = 0,
-#       conf.high = 0,
-#       rel_time = -1
-#     )
-#   ) %>%
-#   arrange(rel_time)
-
-# ggplot(did2s_es_coefs, aes(x = rel_time, y = estimate)) +
-#   geom_point(size = 3, color = "darkgreen") +
-#   geom_errorbar(aes(ymin = conf.low, ymax = conf.high), 
-#                 width = 0.2, color = "darkgreen") +
-#   geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
-#   geom_vline(xintercept = -0.5, linetype = "dotted", color = "blue") +
-#   labs(
-#     title = "Event Study: did2s Estimator (Gardner 2021)",
-#     subtitle = "Two-stage difference-in-differences with proper controls",
-#     x = "Years Relative to Flood",
-#     y = "Treatment Effect Estimate",
-#     caption = "Note: Estimates from did2s package with state-level clustering.\nPeriod -1 omitted as reference. Endpoints binned at -6 and +6."
-#   ) +
-#   theme_minimal() +
-#   theme(
-#     plot.title = element_text(face = "bold", size = 14),
-#     plot.subtitle = element_text(size = 11),
-#     axis.title = element_text(size = 11)
-#   )
 ```
 
 ### ATT Using did_imputation Package
