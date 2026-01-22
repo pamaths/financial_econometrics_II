@@ -1,0 +1,908 @@
+---
+title: "Financial Econometrics II"
+author: "Matias Palmunen"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+## Introduction
+
+This document contains analysis for Financial Econometrics II.
+
+## Load Libraries
+
+```{r load-libraries}
+required_packages <- c(
+  "tidyverse", "haven", "knitr", "kableExtra", "here",
+  "ggplot2", "bacondecomp", "fixest", "did", "did2s", "didimputation"
+)
+
+new_packages <- required_packages[!(required_packages %in% 
+                                    installed.packages()[, "Package"])]
+if (length(new_packages)) {
+  install.packages(new_packages, repos = "https://cloud.r-project.org")
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+```
+
+
+## Helper Functions and Utilities for more DRY analysis
+
+```{r helper-functions}
+
+# --------------------------------
+# Function to save figures for LaTeX with proper sizing
+# --------------------------------
+
+save_figure <- function(plot, filename, width = 6.5, height = 4) {
+  fig_dir <- here::here("tex_report_2", "figures")
+  if (!dir.exists(fig_dir)) {
+    dir.create(fig_dir, recursive = TRUE)
+  }
+  filepath <- file.path(fig_dir, filename)
+
+  ggplot2::ggsave(
+    filename = filepath,
+    plot = plot,
+    width = width,
+    height = height,
+    units = "in",
+    # dpi = 300,
+    device = "pdf"
+  )
+  
+  cat("Figure saved to:", filepath, "\n")
+}
+
+# --------------------------------
+# Function to save tables in LaTeX tabular format
+# --------------------------------
+
+save_table <- function(data, filename) {
+  tables_dir <- here::here("tex_report_2", "tables")
+  if (!dir.exists(tables_dir)) {
+    dir.create(tables_dir, recursive = TRUE)
+  }
+  
+  filepath <- file.path(tables_dir, filename)
+  
+  latex_output <- kable(data, 
+                        format = "latex", 
+                        booktabs = TRUE)
+  
+  # clean the latex output so only tabular saved
+  latex_string <- as.character(latex_output)
+  latex_lines <- strsplit(latex_string, "\n")[[1]]
+  start_idx <- grep("^\\\\begin\\{tabular\\}", latex_lines)
+  end_idx <- grep("^\\\\end\\{tabular\\}", latex_lines)
+  
+  if (length(start_idx) > 0 && length(end_idx) > 0) {
+    # Extract just the tabular environment
+    tabular_lines <- latex_lines[start_idx:end_idx]
+    writeLines(tabular_lines, filepath)
+  } else {
+    # Fallback: write everything
+    writeLines(latex_lines, filepath)
+  }
+  
+  cat("Table saved to:", filepath, "\n")
+}
+
+
+
+# --------------------------------
+# Function to run event study regression with binning
+# --------------------------------
+
+run_event_study <- function(data, min_bin = -10, max_bin = 10, 
+                           cluster_var = "state", ref_period = -1) {
+  # Work on a copy to avoid modifying original data
+  data_copy <- data
+
+  # Apply binning
+  binned_var_name <- paste0("rel_time_binned_", abs(min_bin), "_", abs(max_bin))
+  data_copy <- data_copy %>%
+    mutate(
+      !!binned_var_name := case_when(
+        !ever_treated ~ 0,  # Never-treated units get 0
+        ever_treated & rel_time < min_bin ~ min_bin,
+        ever_treated & rel_time > max_bin ~ max_bin,
+        ever_treated ~ rel_time
+      )
+    )
+  
+  # Construct formula
+  formula_str <- paste0(
+    "ln_policies ~ i(", binned_var_name, ", ever_treated, ref = ", ref_period, ") | id_num + state_year"
+  )
+  event_study_formula <- as.formula(formula_str)
+  
+  # Handle clustering: can be single variable or formula string like "state + year"
+  if (grepl("\\+", cluster_var)) {
+    cluster_formula <- as.formula(paste0("~", cluster_var))
+  } else {
+    cluster_formula <- as.formula(paste0("~", cluster_var))
+  }
+  
+  # Fit model
+  model <- feols(
+    event_study_formula,
+    data = data_copy,
+    cluster = cluster_formula
+  )
+  
+  return(model)
+}
+
+
+
+
+# --------------------------------
+# Function to create event study plot
+# --------------------------------
+create_event_study_plot <- function(coefs_data, title, 
+                                    point_size = 1, 
+                                    base_font_size = 11,
+                                    title_size = 12,
+                                    axis_title_size = 11,
+                                    axis_text_size = 10,
+                                    min_bin = NULL,
+                                    max_bin = NULL) {
+  
+  # Create base plot
+  p <- ggplot(coefs_data, aes(x = rel_time, y = estimate)) +
+    geom_point(size = point_size) +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    geom_vline(xintercept = -0.5, linetype = "dotted", color = "blue") +
+    labs(
+      title = title,
+      x = "Years Relative to Flood",
+      y = "Coefficient Estimate"
+    ) +
+    theme_minimal(base_size = base_font_size) +
+    theme(
+      plot.title = element_text(face = "bold", size = title_size),
+      axis.title = element_text(size = axis_title_size),
+      axis.text = element_text(size = axis_text_size)
+    )
+  
+  # Label x-axis properly for bins
+  all_times <- sort(unique(coefs_data$rel_time))
+  display_times <- all_times[seq(1, length(all_times), by = 2)]
+  if (!is.null(min_bin) && !is.null(max_bin)) {
+    labels <- sapply(display_times, function(t) {
+      if (t == min_bin) {
+        return(paste0("<", min_bin+1))
+      } else if (t == max_bin) {
+        return(paste0(">", max_bin - 1))
+      } else {
+        return(as.character(t))
+      }
+    })
+    
+    p <- p + scale_x_continuous(breaks = display_times, labels = labels)
+  } else {
+    p <- p + scale_x_continuous(breaks = display_times)
+  }
+  
+  return(p)
+}
+```
+
+## Load Data
+
+```{r load-data}
+# Load data from the data folder
+data_path <- here::here("data", "PS2_data.dta")
+ps2_data <- read_dta(data_path) %>%
+  as_tibble()
+
+head(ps2_data)
+```
+
+
+## Problem (b): Event Study Graph
+
+### Data Preparation
+
+```{r data-prep}
+# Load the data
+data_path <- here::here("data", "PS2_data.dta")
+ps2_data <- read_dta(data_path) %>%
+  as_tibble()
+
+# Examine the data structure
+cat("Dataset dimensions:", nrow(ps2_data), "rows ×", ncol(ps2_data), "columns\n\n")
+
+# Show first few rows
+ps2_data %>%
+  head(10) %>%
+  kable(caption = "First 10 rows of PS2 data")
+
+# Check for communities that experienced floods
+flood_summary <- ps2_data %>%
+  group_by(id_num) %>%
+  summarize(
+    num_floods = sum(hityear, na.rm = TRUE),
+    flood_year = ifelse(any(hityear == 1), year[which(hityear == 1)[1]], NA)
+  )
+
+# Communities with exactly one flood
+treated_communities <- flood_summary %>%
+  filter(num_floods == 1)
+
+# Never-treated communities
+never_treated <- flood_summary %>%
+  filter(num_floods == 0)
+
+# Display summary statistics
+tibble(
+  Category = c("Communities with exactly 1 flood", "Never-treated communities", "Total communities"),
+  Count = c(nrow(treated_communities), nrow(never_treated), nrow(flood_summary))
+) %>%
+  kable(caption = "Community Treatment Status Summary")
+```
+
+```{r create-relative-time}
+# Create treatment year variable
+ps2_data <- ps2_data %>%
+  group_by(id_num) %>%
+  mutate(
+    treatment_year = ifelse(any(hityear == 1),
+                           year[which(hityear == 1)[1]],
+                           Inf),
+    rel_time = year - treatment_year,
+    post = as.numeric(year >= treatment_year),
+    never_treated = is.infinite(treatment_year),
+    ever_treated = !is.infinite(treatment_year)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    state_year = interaction(state, year, drop = TRUE)
+  )
+
+# Drop units treated in the first period (no pre-treatment data)
+t0 <- min(ps2_data$year, na.rm = TRUE)
+ps2_data <- ps2_data %>%
+  filter(is.infinite(treatment_year) | treatment_year > t0)
+
+
+```
+
+### Event Study Regression
+
+
+```{r rel-time-hist}
+# To check the validity for binning
+ps2_data %>%
+  filter(is.finite(treatment_year)) %>%
+  mutate(rel_time = year - treatment_year)%>%
+  .$rel_time %>% hist()
+```
+
+```{r event-study-regression}
+# Event study regression with community and state-by-year fixed effects
+event_study_model <- run_event_study(
+  data = ps2_data,
+  min_bin = -11,
+  max_bin = 11,
+  cluster_var = "state",
+  ref_period = -1
+)
+
+# Extract coefficients for plotting
+event_study_coefs <- broom::tidy(
+  event_study_model, conf.int = TRUE) %>%
+  filter(grepl("rel_time", term)) %>%
+  mutate(
+    rel_time = as.numeric(gsub(".*::([-0-9]+).*", "\\1", term))
+  ) %>%
+  # Add the omitted period (-1) with coefficient 0
+  bind_rows(
+    tibble(
+      term = "rel_time_binned::-1",
+      estimate = 0,
+      std.error = 0,
+      statistic = NA,
+      p.value = NA,
+      conf.low = 0,
+      conf.high = 0,
+      rel_time = -1
+    )
+  ) %>%
+  arrange(rel_time)
+```
+
+### Event Study Plot
+
+```{r event-study-plot, fig.width=10, fig.height=6}
+# Create event study plot using the helper function
+p_binned <- create_event_study_plot(
+  coefs_data = event_study_coefs,
+  title = "Event Study: With Binning",
+  min_bin = -11,
+  max_bin = 11
+)
+
+# Display the plot
+print(p_binned)
+
+# Save for LaTeX with larger dimensions for vertical stacking
+save_figure(p_binned, "event_study_binned.pdf", width = 6, height = 4)
+```
+
+### Event Study Plot No Binning
+
+
+```{r event-study-regression-extended}
+# Event study regression with extended time window without binning
+event_study_model_ext <- run_event_study(
+  data = ps2_data,
+  min_bin = -999,
+  max_bin = 999,
+  cluster_var = "state",
+  ref_period = -1
+)
+
+# Extract coefficients for plotting
+event_study_coefs_ext <- broom::tidy(event_study_model_ext, conf.int = TRUE) %>%
+  filter(grepl("rel_time_binned", term)) %>%
+  mutate(
+    rel_time = as.numeric(gsub(".*::([-0-9]+).*", "\\1", term))
+  ) %>%
+  # Add the omitted period (-1) with coefficient 0
+  bind_rows(
+    tibble(
+      term = "rel_time_binned::-1",
+      estimate = 0,
+      std.error = 0,
+      statistic = NA,
+      p.value = NA,
+      conf.low = 0,
+      conf.high = 0,
+      rel_time = -1
+    )
+  ) %>%
+  arrange(rel_time)
+```
+
+```{r event-study-plot-extended, fig.width=10, fig.height=6}
+
+# Create extended event study plot using the helper function
+p_no_binning <- create_event_study_plot(
+  coefs_data = event_study_coefs_ext,
+  title = "Event Study: Without Binning"
+)
+
+# Display the plot
+print(p_no_binning)
+
+# Save for LaTeX with larger dimensions for vertical stacking
+save_figure(p_no_binning, "event_study_no_binning.pdf", width = 6, height = 4)
+```
+
+
+
+### (b)(ii) Standard Error Clustering
+
+```{r clustering-discussion}
+# State-level clustering (Gallagher's choice)
+n_bins = 11
+model_state_cluster <- run_event_study(
+  data = ps2_data,
+  min_bin = -n_bins,
+  max_bin = n_bins,
+  cluster_var = "state"
+)
+
+# Community-level clustering
+model_community_cluster <- run_event_study(
+  data = ps2_data,
+  min_bin = -n_bins,
+  max_bin = n_bins,
+  cluster_var = "id_num"
+)
+
+# Two-way clustering (state and year)
+model_twoway_cluster <- run_event_study(
+  data = ps2_data,
+  min_bin = -n_bins,
+  max_bin = n_bins,
+  cluster_var = "state + year"
+)
+
+
+clustering_comparison <- bind_rows(
+  broom::tidy(model_state_cluster, conf.int = TRUE) %>% mutate(Clustering = "State"),
+  broom::tidy(model_community_cluster, conf.int = TRUE) %>% mutate(Clustering = "Community"),
+  broom::tidy(model_twoway_cluster, conf.int = TRUE) %>% mutate(Clustering = "State + Year")
+)
+
+clustering_comparison %>%
+  select(Clustering, term, estimate, std.error, p.value) %>%
+  mutate(across(c(estimate, std.error, p.value), ~round(., 4))) %>%
+  filter(term != "(Intercept)") %>%
+  head(15) %>%
+  kable(caption = "Comparison of Standard Errors by Clustering Method (Selected Coefficients)",
+        col.names = c("Clustering", "Term", "Estimate", "Std. Error", "P-value"))
+```
+
+### Visualization of Standard Error Differences
+
+```{r clustering-visualization, fig.width=10, fig.height=8}
+
+clustering_plot_data <- clustering_comparison %>%
+  filter(grepl("rel_time", term)) %>%
+  mutate(
+    rel_time = as.numeric(gsub(".*::([-0-9]+).*", "\\1", term)),
+    Clustering = factor(Clustering, levels = c("State", "Community", "State + Year"))
+  ) %>%
+  bind_rows(
+    tibble(
+      term = rep("rel_time_binned::-1", 3),
+      estimate = rep(0, 3),
+      std.error = rep(0, 3),
+      conf.low = rep(0, 3),
+      conf.high = rep(0, 3),
+      rel_time = rep(-1, 3),
+      Clustering = factor(c("State", "Community", "State + Year"), 
+                         levels = c("State", "Community", "State + Year"))
+    )
+  ) %>%
+  arrange(Clustering, rel_time)
+
+# Plot 1: Confidence intervals comparison
+all_times <- sort(unique(clustering_plot_data$rel_time))
+display_times <- all_times[seq(1, length(all_times), by = 2)]
+
+# Bin labeling
+labels <- sapply(display_times, function(t) {
+  if (t == -n_bins) {
+    return(paste0("<", -n_bins + 1))
+  } else if (t == n_bins) {
+    return(paste0(">", n_bins - 1))
+  } else {
+    return(as.character(t))
+  }
+})
+
+p1 <- ggplot(clustering_plot_data, aes(x = rel_time, y = estimate, color = Clustering)) +
+  geom_point(position = position_dodge(width = 0.8), size = 1) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), 
+                position = position_dodge(width = 0.8), 
+                width = 0.4, alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray30") +
+  geom_vline(xintercept = -0.5, linetype = "dotted", color = "gray50") +
+  scale_color_manual(values = c("State" = "#E41A1C", 
+                                "Community" = "#377EB8", 
+                                "State + Year" = "#4DAF4A")) +
+  scale_x_continuous(breaks = display_times, labels = labels) +
+  labs(
+    #title = "Comparison of Confidence Intervals by Clustering Method",
+    #subtitle = "Wider intervals indicate larger standard errors",
+    x = "Years Relative to Flood",
+    y = "Coefficient Estimate",
+    color = "Clustering"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 10),
+    legend.position = "bottom"
+  )
+print(p1)
+
+# Save figure for LaTeX
+save_figure(p1, "clustering_comparison.pdf", width = 6, height = 5)
+
+```
+
+```{r}
+# Summary statistics of standard errors by clustering method
+clustering_se_summary <- clustering_plot_data %>%
+  filter(rel_time != -1) %>%
+  group_by(Clustering) %>%
+  summarise(
+    `Mean SE` = mean(std.error, na.rm = TRUE),
+    `Median SE` = median(std.error, na.rm = TRUE),
+    `Min SE` = min(std.error, na.rm = TRUE),
+    `Max SE` = max(std.error, na.rm = TRUE)
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 4)))
+
+clustering_se_summary %>%
+  kable(caption = "Summary Statistics of Standard Errors by Clustering Method")
+
+# Save table for LaTeX (only tabular content)
+# save_table(clustering_se_summary, "clustering_se_summary.tex")
+```
+
+
+
+
+## Problem (c): Bacon-Goodman Decomposition
+
+
+
+```{r bacon-decomposition}
+# cache the results as the decomposition can be slow to compute
+bacon_cache_path <- here::here("data", "bacon_decomposition_cache.rds")
+bacon_run_new <- FALSE
+n_sample <- 7000  # Sample for testing. Over 7000 uses all the data
+set.seed(123)
+
+bacon_data <- ps2_data %>%
+  mutate(
+    treated = post
+  )
+
+all_ids <- unique(bacon_data$id_num)
+
+# Implement sampling
+if (length(all_ids) > n_sample) {
+  sampled_ids <- sample(all_ids, n_sample)
+  bacon_data_final <- bacon_data %>%
+    filter(id_num %in% sampled_ids)
+  cat("Sampling", n_sample, "units from", length(all_ids), "total units for computational feasibility\n")
+} else {
+  bacon_data_final <- bacon_data
+  cat("Using all", length(all_ids), "units\n")
+}
+
+tibble(
+  Metric = c("Original panel size", "Sampled panel size", "Number of units sampled"),
+  Value = c(nrow(ps2_data), nrow(bacon_data_final), length(unique(bacon_data_final$id_num)))
+) %>%
+  kable(caption = "Panel Structure for Bacon Decomposition")
+
+
+# Check if cached Bacon decomposition exists
+if (file.exists(bacon_cache_path) && (bacon_run_new == FALSE)) {
+  cat("Loading cached Bacon decomposition from:", bacon_cache_path, "\n")
+  bacon_decomp <- readRDS(bacon_cache_path)
+} else {
+  cat("Running Bacon decomposition (this may take a while)...\n")
+  bacon_decomp <- bacon(
+    ln_policies ~ treated,
+    data = bacon_data_final,
+    id_var = "id_num",
+    time_var = "year"
+  )
+  
+  # Save the result
+  saveRDS(bacon_decomp, bacon_cache_path)
+  cat("Bacon decomposition saved to:", bacon_cache_path, "\n")
+  bacon_ran_fresh <- TRUE
+}
+
+
+
+```
+
+```{r bacon-summary}
+
+# Summarize decomposition
+bacon_summary_table <- bacon_decomp %>%
+  as_tibble() %>%
+  group_by(type) %>%
+  summarise(
+    # `N Comparisons` = n(),
+    `Total Weight` = sum(weight),
+    `Avg Estimate` = weighted.mean(estimate, weight), 
+    `Contribution` = sum(weight * estimate),
+    .groups = 'drop'
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 4)))
+
+bacon_summary_table %>%
+  kable(caption = "Bacon-Goodman Decomposition Summary")
+
+save_table(bacon_summary_table, "bacon_decomposition_summary.tex")
+
+
+print(bacon_summary_table)
+
+
+```
+
+```{r bacon plot}
+# Visualize decomposition
+p_bacon <- ggplot(bacon_decomp, aes(x = weight, y = estimate, shape = type, color = type)) +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    # title = "Bacon-Goodman Decomposition",
+    # subtitle = "Weights and estimates by comparison type",
+    x = "Weight",
+    y = "2x2 DiD Estimate",
+    shape = "Comparison Type",
+    color = "Comparison Type"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 10),
+    legend.position = "bottom"
+  )
+
+print(p_bacon)
+
+# Save figure for LaTeX
+save_figure(p_bacon, "bacon_decomposition.pdf", width = 6, height = 5)
+```
+
+
+
+
+## Problem (d): Imputation Estimator by Hand
+
+
+```{r temp}
+ps2_data %>% filter(post == 0 )
+```
+
+```{r imputation-manual}
+# Step 1: Estimate fixed effects using only untreated observations
+# Untreated observations are those where post == 0 (not yet treated or never treated)
+untreated_data <- ps2_data %>% filter(post == 0)
+fe_model_untreated <- feols(
+  ln_policies ~ 1 | id_num + state_year,
+  data = untreated_data
+)
+
+# Step 2: Extract fixed effects
+unit_fes <- fixef(fe_model_untreated)$id_num
+time_fes <- fixef(fe_model_untreated)$state_year
+
+unit_fe_df <- tibble(
+  id_num = as.numeric(names(unit_fes)),
+  lambda_i = as.numeric(unit_fes)
+)
+time_fe_df <- tibble(
+  state_year = as.character(names(time_fes)),
+  gamma_t = as.numeric(time_fes)
+)
+
+# Step 3: For all observations, compute imputed counterfactual Y(0)
+# tau_hat will be computed for all observations (both pre and post treatment)
+# NB: This is done so that we do the event study figure, when estimating coefficient I use only 
+# treated units
+ps2_data_impute <- ps2_data %>%
+  left_join(unit_fe_df, by = "id_num") %>%
+  left_join(time_fe_df, by = "state_year") %>%
+  mutate(
+    Y_hat_0 = lambda_i + gamma_t,
+    tau_hat = ln_policies - Y_hat_0
+  )
+
+imputation_summary <- ps2_data_impute %>%
+  filter(!is.na(tau_hat)) %>%
+  summarise(
+    N = n(),
+    Mean = mean(tau_hat),
+    Median = median(tau_hat),
+    SD = sd(tau_hat),
+    Min = min(tau_hat),
+    Max = max(tau_hat)
+  ) %>%
+  mutate(across(where(is.numeric) & !N, ~round(., 4)))
+```
+
+### Event Study Plot with Imputation Estimator
+
+Second stage: regress tau_hat on event-time dummies. 
+Note here we use $\Omega_0 \cap \Omega_1$ (post treatment, and pre treatment) so that we can also see the pre-treatment effects. 
+
+
+```{r imputation-event-study}
+imputation_event_data <- ps2_data_impute %>%
+  mutate(
+    rel_time_binned = case_when(
+      rel_time < -n_bins ~ -n_bins,
+      rel_time > n_bins ~ n_bins,
+      TRUE ~ rel_time
+    )
+  ) %>%
+  filter(is.finite(tau_hat) & !is.na(rel_time_binned))
+
+m_imp <- feols(
+  tau_hat ~ i(rel_time_binned, ref = -1),
+  data = imputation_event_data,
+  cluster = ~ state
+)
+
+# Extract coefficients for plotting
+imputation_coefs <- broom::tidy(m_imp, conf.int = TRUE) %>%
+  filter(grepl("rel_time_binned", term)) %>%
+  mutate(
+    rel_time = as.numeric(gsub(".*::([-0-9]+).*", "\\1", term))
+  ) %>%
+  
+    tibble(
+      term = "rel_time_binned::-1",
+      estimate = 0,
+      std.error = 0,
+      statistic = NA,
+      p.value = NA,
+      conf.low = 0,
+      conf.high = 0,
+      rel_time = -1
+    ) %>%
+  arrange(rel_time)
+```
+
+```{r imputation-event-study-plot, fig.width=10, fig.height=6}
+
+p_imputation <- create_event_study_plot(
+  coefs_data = imputation_coefs,
+  title = "",#Event Study: Imputation Estimator (Manual Implementation)",
+  min_bin = -n_bins,
+  max_bin = n_bins
+)
+
+print(p_imputation)
+
+# Save figure for LaTeX
+save_figure(p_imputation, "imputation_event_study.pdf", width = 6, height = 5)
+```
+
+
+
+
+
+## Problem (e): ATT Estimation and Comparison
+
+
+
+### Manual ATT Estimation
+
+For manual ATT estimation, we take the simple average of the imputed treatment effects (tau_hat) for treated observations only (i.e. those with post == 1).
+Thus, naturally, we disrecard observations that are treated in the start of the sample (no pre-treatment data) as these don't have valid tau_hat.
+
+```{r att-manual}
+# Estimate ATT as simple average of tau_hat for treated observations
+att_manual <- ps2_data_impute %>%
+  filter(post == 1, !is.na(tau_hat)) %>%
+  summarize(
+    ATT = mean(tau_hat),
+    SE_incorrect = sd(tau_hat) / sqrt(n()),
+    n_treated = n()
+  )
+
+# Alternative: regress tau_hat on treatment indicator with clustering
+att_regression <- feols(
+  tau_hat ~ 1,
+  cluster = ~ state, 
+  data = ps2_data_impute %>% filter(post == 1, !is.na(tau_hat))
+)
+att_reg_tidy <- broom::tidy(att_regression, conf.int = TRUE)
+
+# Display manual ATT results - both methods
+bind_rows(
+  att_manual %>%
+    mutate(
+      Method = "Manual (Simple Average of τ̂)",
+      `ATT Estimate` = ATT,
+      `SE (Incorrect)` = SE_incorrect,
+      `N Treated Obs` = n_treated
+    ) %>%
+    select(Method, `ATT Estimate`, `SE (Incorrect)`, `N Treated Obs`),
+  tibble(
+    Method = "Manual (Regression on constant, clustered)",
+    `ATT Estimate` = att_reg_tidy$estimate[1],
+    `SE (Incorrect)` = att_reg_tidy$std.error[1],
+    `N Treated Obs` = nobs(att_regression)
+  )
+) %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  kable(caption = "Manual ATT Estimation Results (Both Methods Should Match)")
+```
+
+### ATT Using did_imputation Package
+
+```{r att-package-didimputation}
+did_imputation_data <- ps2_data
+
+dimp_result <- did_imputation(
+  data = did_imputation_data,
+  yname = "ln_policies",
+  gname = "treatment_year",
+  tname = "year",
+  idname = "id_num",
+  first_stage = ~ 0 | id_num + state_year,
+  cluster_var = "state"
+)
+
+dimp_result %>%
+  as.data.frame() %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  kable(caption = "did_imputation Package Results (Borusyak et al. 2024)")
+
+att_dimp <- mean(dimp_result$estimate, na.rm = TRUE)
+se_dimp <- mean(dimp_result$std.error, na.rm = TRUE)
+
+```
+
+
+```{r didimputation-event-study, fig.width=10, fig.height=6}
+dimp_es_data <- ps2_data # %>%  filter(!is.infinite(treatment_year))
+
+dimp_es_result <- did_imputation(
+  data = dimp_es_data,
+  yname = "ln_policies",
+  gname = "treatment_year",
+  tname = "year",
+  idname = "id_num",
+  first_stage = ~ 0 | id_num + state_year,
+  horizon = TRUE,
+  pretrends = TRUE,
+  cluster_var = "state"
+)
+
+```
+
+```{r didimputation-event-study-plot}
+
+dimp_es_coefs <- dimp_es_result %>%
+  as.data.frame() %>%
+  filter(!is.na(term)) %>%
+  mutate(
+    rel_time = as.numeric(gsub(".*[^0-9-]([0-9-]+)$", "\\1", term)),
+    conf.low = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error
+  ) %>%
+  arrange(rel_time)
+
+p_did_imputation <- create_event_study_plot(
+  coefs_data = dimp_es_coefs,
+  title = "Event Study: did_imputation Estimator (Borusyak et al. 2024)"
+)
+
+print(p_did_imputation)
+
+# Save figure for LaTeX
+# save_figure(p_did_imputation, "did_imputation_event_study.pdf", width = 6, height = 4)
+
+```
+
+
+### Comparison of imputations and Discussion
+
+```{r comparison}
+# Create comprehensive comparison table
+imputation_summary  <- tibble(
+  Method = c("Manual Implementation", "Manual Implementation (clustered)", "Package (did_imputation)"),
+  `ATT Estimate` = c(att_manual$ATT, att_reg_tidy$estimate[1], att_dimp),
+  `Standard Error` = c(att_manual$SE_incorrect, att_reg_tidy$std.error[1], se_dimp),
+  `SE Note` = c("Incorrect (naive)", "Correct (clustered)", "Correct (clustered)")
+)  %>%
+  mutate(across(where(is.numeric), ~round(., 4)))# %>%
+  # kable(caption = "Comparison of ATT Estimates") %>%
+  # footnote(general = "did_imputation: Borusyak et al. (2024)")
+
+
+
+# Save table for LaTeX
+save_table(imputation_summary, "imputation_summary.tex")
+
+imputation_summary
+```
